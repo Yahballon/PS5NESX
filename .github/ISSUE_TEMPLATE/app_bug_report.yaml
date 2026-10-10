@@ -1,0 +1,29 @@
+# PS5NES bug reports (AI-assisted)
+name: Bug report
+description: Report a PS5NES problem.
+title: "[Bug] "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Include the PS5NES version, firmware and launcher, reproduction steps,
+        and whether games are on internal storage, USB or NFS. Remove private
+        addresses and tokens from logs. Do not attach ROMs, firmware or keys.
+  - type: input
+    id: version
+    attributes:
+      label: PS5NES version, PS5 firmware and launcher
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps to reproduce and expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior and relevant logs
+    validations:
+      required: true

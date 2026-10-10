@@ -1,0 +1,29 @@
+#version 460
+/*
+ * PS5 Vulkan - RADV smoke test: a task shader with a full payload.
+ * Copyright (C) 2026 Mihawk-99
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ *
+ * Each task workgroup fills its 16 KiB payload with its own number and
+ * launches two mesh workgroups, which paint their cells from the payload's
+ * first and last words. 8,192 task workgroups need two of the port's chunks.
+ */
+#extension GL_EXT_mesh_shader : require
+
+layout(local_size_x = 32) in;
+
+struct Payload {
+    uint words[4096];
+};
+taskPayloadSharedEXT Payload payload;
+
+void main()
+{
+    /* A later draw of an indirect pair numbers its workgroups after the
+     * draw before's. */
+    const uint task = gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x +
+                      uint(gl_DrawID) * gl_NumWorkGroups.x * gl_NumWorkGroups.y;
+    for (uint i = gl_LocalInvocationIndex; i < 4096u; i += 32u)
+        payload.words[i] = i == 0u ? task ^ 0x5a5au : task;
+    EmitMeshTasksEXT(2, 1, 1);
+}

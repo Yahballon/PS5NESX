@@ -1,0 +1,45 @@
+#version 460
+/*
+ * PS5 Vulkan - RADV smoke test: a mesh shader whose outputs follow an atomic.
+ * Copyright (C) 2026 Mihawk-99
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ *
+ * Each workgroup takes a ticket from a counter and covers its 8-pixel cell
+ * with 128 triangles in the ticket's colour. Without per-primitive parameters
+ * the port gives each triangle vertices of its own and sends a workgroup's
+ * 384 of them in two parts; both must show the one ticket the workgroup took.
+ */
+#extension GL_EXT_mesh_shader : require
+
+layout(local_size_x = 32) in;
+layout(triangles, max_vertices = 81, max_primitives = 128) out;
+
+layout(set = 0, binding = 0, std430) buffer Tickets { uint next; } tickets;
+layout(location = 0) perprimitiveEXT out vec4 colour[];
+
+shared uint ticket;
+
+void main()
+{
+    if (gl_LocalInvocationIndex == 0)
+        ticket = atomicAdd(tickets.next, 1u);
+    barrier();
+    const uint t = ticket;
+
+    SetMeshOutputsEXT(81, 128);
+
+    /* 32 cells a row over the 256-pixel target; a later draw of an indirect
+     * pair takes the rows below the one before. */
+    const uvec2 cell = uvec2(gl_WorkGroupID.x, gl_WorkGroupID.y + uint(gl_DrawID) * gl_NumWorkGroups.y);
+    for (uint v = gl_LocalInvocationIndex; v < 81u; v += 32u) {
+        const vec2 pixel = vec2(cell * 8u + uvec2(v % 9u, v / 9u));
+        gl_MeshVerticesEXT[v].gl_Position = vec4(pixel / 128.0 - 1.0, 0.0, 1.0);
+    }
+    const vec4 c = vec4(float(t & 255u) / 255.0, float(t >> 8u) / 255.0, 0.0, 1.0);
+    for (uint p = gl_LocalInvocationIndex; p < 128u; p += 32u) {
+        const uint quad = p / 2u;
+        const uint v0 = (quad / 8u) * 9u + quad % 8u;
+        gl_PrimitiveTriangleIndicesEXT[p] = (p & 1u) == 0u ? uvec3(v0, v0 + 1u, v0 + 10u) : uvec3(v0, v0 + 10u, v0 + 9u);
+        colour[p] = c;
+    }
+}

@@ -1,0 +1,7 @@
+# upstream test	native gate	coverage
+tests/spec/arb_compute_shader/execution/basic-ssbo.shader_test	egl_public_gl46_piglit	ordered SSBO writes and atomic-counter observations
+tests/spec/arb_buffer_storage/bufferstorage.c	egl_public_gl44_state	persistent/coherent immutable storage visibility
+tests/spec/arb_compute_shader/execution/simple-barrier-atomics.shader_test	egl_public_compute_api	compute barriers and atomic counters
+tests/spec/arb_shader_storage_buffer_object/execution/ssbo-atomicAdd-int.shader_test	egl_public_compute_render	fragment SSBO atomics and guards
+tests/spec/arb_shader_draw_parameters/drawid-indirect.c	egl_public_draw_indirect	indirect draw command consumption
+tests/spec/arb_gl_spirv/execution/cs-basic-ssbo.shader_test	egl_public_gl46_spirv	SPIR-V load, specialize, link, and execution

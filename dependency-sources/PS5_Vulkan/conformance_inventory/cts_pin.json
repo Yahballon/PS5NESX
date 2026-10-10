@@ -1,0 +1,63 @@
+{
+  "cts": {
+    "commit": "f6a29701220f34dd1407513bfe80d74ca7b392ce",
+    "repo": "https://github.com/KhronosGroup/VK-GL-CTS.git",
+    "tag": "vulkan-cts-1.4.6.2",
+    "verified_head": "f6a29701220f34dd1407513bfe80d74ca7b392ce"
+  },
+  "external_checked_out": {
+    "amber": "53a4c8934bf7335d27c694e9fdac9ae1b180c0d2",
+    "glslang": "715c8500e7cd67f2eba9e60e98852a1ed49d2f15",
+    "jsoncpp": "9059f5cad030ba11d37818847443a53918c327b1",
+    "spirv-headers": "6dd7ba990830f7c15ac1345ff3b43ef6ffdad216",
+    "spirv-tools": "2d14d2e76aa7de72404b17078eda15c20a6a0389",
+    "video_generator": "426300e12a5cc5d4676807039a1be237a2b68187",
+    "vulkan-docs": "4abe0260bbd8e59930786eed645481808a3fe6f1"
+  },
+  "external_declared": {
+    "files": {
+      "renderdoc": [
+        {
+          "file": "renderdoc_app.h",
+          "sha256": "e7b5f0aa5b1b0eadc63a1c624c0ca7f5af133aa857d6a4271b0ef3d0bdb6868e",
+          "url": "https://raw.githubusercontent.com/baldurk/renderdoc/v1.1/renderdoc/api/app/renderdoc_app.h"
+        }
+      ]
+    },
+    "git": {
+      "amber": {
+        "revision": "53a4c8934bf7335d27c694e9fdac9ae1b180c0d2",
+        "url": "https://github.com/google/amber.git"
+      },
+      "glslang": {
+        "revision": "715c8500e7cd67f2eba9e60e98852a1ed49d2f15",
+        "url": "https://github.com/KhronosGroup/glslang.git"
+      },
+      "jsoncpp": {
+        "revision": "9059f5cad030ba11d37818847443a53918c327b1",
+        "url": "https://github.com/open-source-parsers/jsoncpp.git"
+      },
+      "spirv-headers": {
+        "revision": "6dd7ba990830f7c15ac1345ff3b43ef6ffdad216",
+        "url": "https://github.com/KhronosGroup/SPIRV-Headers.git"
+      },
+      "spirv-tools": {
+        "revision": "2d14d2e76aa7de72404b17078eda15c20a6a0389",
+        "url": "https://github.com/KhronosGroup/SPIRV-Tools.git"
+      },
+      "video_generator": {
+        "revision": "426300e12a5cc5d4676807039a1be237a2b68187",
+        "url": "https://github.com/Igalia/video_generator.git"
+      },
+      "vulkan-docs": {
+        "revision": "4abe0260bbd8e59930786eed645481808a3fe6f1",
+        "url": "https://github.com/KhronosGroup/Vulkan-Docs.git"
+      },
+      "vulkan-validationlayers": {
+        "revision": "eb51484e6039752b56e8f70b5c33f04874224bfb",
+        "url": "https://github.com/KhronosGroup/Vulkan-ValidationLayers.git"
+      }
+    }
+  },
+  "note": "Phase E1 pin (docs/CTS.md). Three different things, kept apart on purpose: the CTS revision, verified from the checkout; the external revisions the CTS's own external/fetch_sources.py declares; and the revisions actually checked out under external/. None of them is what a build compiles -- that belongs in the build's manifest."
+}

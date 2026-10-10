@@ -1,0 +1,155 @@
+#!/usr/bin/env python3
+# PS5 OpenGL - OpenGL implementation for PlayStation 5.
+# Copyright (C) 2026 BlackBearReloaded
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+"""Audit owned-heap observations; does not measure GPU memory or process RSS."""
+import argparse
+import json
+from pathlib import Path
+from opengl_receipts import normalize_log_tags
+import re
+
+
+def summarize(text, sessions=1, steady_samples=0):
+    text = normalize_log_tags(text)
+    pattern = (r"^\[ps5-opengl-heap\] phase=(begin|steady|end) sample=(\d+) state=(-?\d+) "
+               r"live_bytes=(\d+) peak_bytes=(\d+) blocks=(\d+) failures=(\d+) "
+               r"ambiguous_zero_reallocs=(\d+)$")
+    rows = [(phase, *map(int, values)) for phase, *values in re.findall(pattern, text, re.M)]
+    if len(rows) != text.count("[ps5-opengl-heap]") or not rows:
+        raise ValueError("missing or malformed heap samples")
+    groups, current = [], None
+    peak = 0
+    for row in rows:
+        phase, sample, state, live, high, blocks, failures, ambiguous = row
+        if failures or ambiguous or high < max(peak, live) or (state != 2 and (phase != "begin" or state != 0)):
+            raise ValueError("invalid/inconclusive heap counters or allocation failure")
+        peak = high
+        if phase == "begin":
+            if current is not None or sample != 0:
+                raise ValueError("overlapping heap sessions")
+            current = []
+        elif current is None:
+            raise ValueError("heap sample outside a session")
+        current.append(row)
+        if phase == "end":
+            if sample != 0:
+                raise ValueError("invalid end sample")
+            groups.append(current)
+            current = None
+    if current is not None or len(groups) != sessions:
+        raise ValueError("incomplete or unexpected heap sessions")
+    reports = []
+    for group in groups:
+        steady = [r for r in group if r[0] == "steady"]
+        if len(steady) != steady_samples or any(a[1] >= b[1] for a, b in zip(steady, steady[1:])):
+            raise ValueError("missing/duplicate steady heap samples")
+        if steady and steady[0][1] != 0:
+            raise ValueError("missing initial steady sample")
+        # Exclude the initial frame; subsequent samples follow 30-second warm-up.
+        live = [r[3] for r in steady[1:]]
+        reports.append(dict(begin_bytes=group[0][3], end_bytes=group[-1][3],
+                            end_blocks=group[-1][5], peak_bytes=group[-1][4],
+                            steady_samples=len(steady),
+                            steady_growth_bytes=live[-1] - live[0] if len(live) >= 2 else None,
+                            steady_range_bytes=max(live) - min(live) if live else None))
+    return dict(scope="owned heap usable bytes; excludes GPU mappings, foreign heaps and RSS",
+                sessions=reports, post_session_growth_bytes=(groups[-1][-1][3] - groups[0][-1][3]
+                                                             if len(groups) > 1 else None))
+
+
+def self_test():
+    def row(phase, sample=0, live=16, blocks=1):
+        return (f"[ps5-opengl-heap] phase={phase} sample={sample} state=2 live_bytes={live} "
+                f"peak_bytes=64 blocks={blocks} failures=0 ambiguous_zero_reallocs=0\n")
+    text = row("begin") + row("steady") + row("steady", 1800) + row("steady", 3600) + row("end")
+    assert summarize(text, steady_samples=3)["sessions"][0]["steady_growth_bytes"] == 0
+    assert summarize(text, steady_samples=3)["post_session_growth_bytes"] is None
+    assert summarize(row("begin") + row("end") + row("begin") + row("end", live=32),
+                     sessions=2)["post_session_growth_bytes"] == 16
+    for bad in ("", text + row("end"), text.replace("state=2", "state=-1"),
+                text.replace("failures=0", "failures=1"), text.replace("phase=end", "phase=steady"),
+                text.replace("ambiguous_zero_reallocs=0", "ambiguous_zero_reallocs=1"),
+                text.replace("sample=3600", "sample=1800"), text.replace("peak_bytes=64", "peak_bytes=1")):
+        try:
+            summarize(bad, steady_samples=3)
+        except ValueError:
+            continue
+        raise AssertionError("invalid heap receipt accepted")
+    print("app-heap audit: self-test PASS")
+
+
+def summarize_gpu(text, sessions=1, steady_samples=0):
+    text = normalize_log_tags(text)
+    pattern = (r"^\[ps5-opengl-gpu-memory\] phase=(begin|steady|end) sample=(\d+) "
+               r"direct_bytes=(\d+) direct_peak=(\d+) allocations=(\d+) "
+               r"mapped_bytes=(\d+) mapped_peak=(\d+) mappings=(\d+) failures=(\d+) invalid=(\d+)$")
+    rows = [(phase, *map(int, values)) for phase, *values in re.findall(pattern, text, re.M)]
+    if not rows or len(rows) != text.count("[ps5-opengl-gpu-memory]"):
+        raise ValueError("missing or malformed GPU samples")
+    reports = {}
+    for name, offset in (("direct", 2), ("mapped", 5)):
+        normalized = []
+        balance = None
+        for row in rows:
+            phase, sample = row[:2]
+            live, peak, count = row[offset:offset + 3]
+            if bool(live) != bool(count):
+                raise ValueError("inconsistent GPU bytes/count")
+            if phase == "begin":
+                balance = (live, count)
+            if phase == "end" and (live, count) != balance:
+                raise ValueError(f"{name} GPU allocations did not return to session baseline")
+            normalized.append(f"[ps5-opengl-heap] phase={phase} sample={sample} state=2 "
+                              f"live_bytes={live} peak_bytes={peak} blocks={count} "
+                              f"failures={row[8]} ambiguous_zero_reallocs={row[9]}")
+        # Reuse the existing strict ordering, high-water, failure and sample checks.
+        reports[name] = summarize("\n".join(normalized), sessions, steady_samples)["sessions"]
+        if not reports[name][-1]["peak_bytes"]:
+            raise ValueError("no GPU allocation activity captured")
+    return dict(scope="linked title direct allocations/mappings; excludes module-internal allocations and CPU mmap",
+                **reports)
+
+
+def gpu_self_test():
+    def row(phase, live=0, sample=0):
+        return (f"[ps5-opengl-gpu-memory] phase={phase} sample={sample} direct_bytes={live} "
+                f"direct_peak=16384 allocations={int(bool(live))} mapped_bytes={live} "
+                f"mapped_peak=16384 mappings={int(bool(live))} failures=0 invalid=0\n")
+    text = row("begin") + row("steady", 16384) + row("steady", 16384, 1800) + row("end")
+    assert summarize_gpu(text, steady_samples=2)["direct"][0]["end_bytes"] == 0
+    assert len(summarize_gpu(text + text, sessions=2, steady_samples=2)["mapped"]) == 2
+    for bad in ("", text[:-1].rsplit("\n", 1)[0], text + row("end"),
+                text.replace("invalid=0", "invalid=1"), text.replace("failures=0", "failures=1"),
+                text.replace(row("end"), row("end",16384)),
+                text.replace("sample=1800", "sample=0"),
+                text.replace("mapped_peak=16384", "mapped_peak=0"),
+                text.replace("allocations=1", "allocations=0")):
+        try:
+            summarize_gpu(bad, steady_samples=2)
+        except ValueError:
+            continue
+        raise AssertionError("invalid GPU receipt accepted")
+    print("GPU-memory audit: self-test PASS")
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("receipt", type=Path, nargs="?")
+    parser.add_argument("--sessions", type=int, default=1)
+    parser.add_argument("--steady-samples", type=int, default=0)
+    parser.add_argument("--self-test", action="store_true")
+    parser.add_argument("--gpu", action="store_true", help="also require balanced linked-title GPU memory")
+    args = parser.parse_args()
+    if args.self_test:
+        self_test()
+        gpu_self_test()
+    elif not args.receipt:
+        parser.error("receipt required")
+    else:
+        text = args.receipt.read_text()
+        result = summarize(text, args.sessions, args.steady_samples)
+        if args.gpu:
+            result["gpu"] = summarize_gpu(text, args.sessions, args.steady_samples)
+        print(json.dumps(result, indent=2))

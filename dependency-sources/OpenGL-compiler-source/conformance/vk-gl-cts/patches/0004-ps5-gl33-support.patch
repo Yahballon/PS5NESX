@@ -1,0 +1,22 @@
+PS5 OpenGL - upstream integration patch.
+PS5 modifications by BlackBearReloaded, 2026.
+Upstream copyrights and per-file licenses remain unchanged.
+See THIRD_PARTY_NOTICES.md for source and license references.
+
+diff --git a/external/openglcts/modules/CMakeLists.txt b/external/openglcts/modules/CMakeLists.txt
+index 7d304de6e..ab795a08d 100644
+--- a/external/openglcts/modules/CMakeLists.txt
++++ b/external/openglcts/modules/CMakeLists.txt
+@@ -57,7 +57,10 @@ if (DEQP_TARGET_NAME STREQUAL "PS5 OpenGL")
+         ps5/glcPS5GL33PackageEntry.cpp
+         ps5/glcPS5GL33PackageEntry.hpp
+     )
+     target_include_directories(ps5-gl33-package PRIVATE gl ps5)
+-    target_link_libraries(ps5-gl33-package PUBLIC glcts-gl tcutil-platform)
++    target_link_libraries(ps5-gl33-package PUBLIC
++        glcts-gl glcts-es31 glcts-esext deqp-gles31${MODULE_LIB_TARGET_POSTFIX}
++        tcutil-platform
++    )
+     add_dependencies(ps5-gl33-package glcts-data)
+ 
+     add_library(ps5-gl33-runner STATIC ps5/glcPS5Main.cpp)

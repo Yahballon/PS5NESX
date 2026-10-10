@@ -1,0 +1,64 @@
+# Upstream Sokol cube
+
+Bounded native adaptation of [cube-glfw.c](https://github.com/floooh/sokol-samples/blob/8afa83928ce1870efeb0d513e7c4dce4f5db7b3e/glfw/cube-glfw.c):
+180 rotating, depth-tested and back-face-culled frames at 1920x1080.
+This is a small existing 3D sample, not a GLFW port or a game benchmark.
+
+The September 7 final SDK passes all 180 frames and 2,596 pixel checks with
+`PS5_SOKOL_HEAP_READBACK=1`, including the original large allocation before
+shader setup. The lower-memory scanline mode remains the default example.
+See [release validation](../../docs/validation.md); historical diagnosis follows.
+
+```sh
+python3 tools/fetch-sources.py --sokol-samples
+make test-sokol-cube
+PS5_OPENGL_PREFIX=/absolute/path/to/candidate-sdk make sokol-cube
+```
+
+The standard native builder produces the PPSA99005 folder. Use the documented
+bounded folder-upload/launch protocol; never send its graphics executable to a loader.
+
+The generator verifies both pinned upstream checkouts and leaves them unchanged.
+Its six exact adaptations are: native window glue include, vecmath include path,
+wrapped entry point, GLSL 410 to 330 Core (no shader logic change), four samples
+to one, and an error-recording logger. Geometry, transforms, vertex/index buffers,
+uniforms, pipeline state and draw calls are retained. Platform glue replaces the
+800x600 desktop window with the native fullscreen EGL surface and limits the loop;
+there is no interactive input. The software-Mesa host uses a single-buffered
+pbuffer with explicit front-buffer selection; the native window is unchanged.
+
+At frames 0/44/89/134/179, 17 RGBA8 scanline readbacks are compared with independent CPU
+ray/unit-box intersections using the intended transform. A 31x17 grid checks
+foreground face colors and background, excluding ambiguous cube-edge probes;
+color tolerance is two byte values. The host checks 2,596 pixels over five poses
+and rejects an intentionally erased cube. Readbacks do not prove TV scanout or
+input health. The readback buffer is 7,680 bytes, not a full 8,294,400-byte image.
+The first native candidate aborted during GLSL built-in initialization after
+allocation failure, before drawing. With the small buffer, native commit `a81c24d`
+passes all 180 frames and 2,596 probes, EGL cleanup and title teardown. This supports
+test-buffer memory pressure as the trigger; larger application-memory robustness
+remains unvalidated. Busy VideoOut unregister followed by successful close remains.
+
+The optional `PS5_SOKOL_MAPPED_READBACK=1 make sokol-cube` control restores the
+full-frame readback using an anonymous CPU mapping, rounded to the native 16 KiB
+page size and released with `munmap`. It changes no GL/shader/driver path and does
+not replace `malloc`, expand the app's resource budget or access other memory.
+Run `bash tools/test-sokol-cube-host.sh --mapped` first; it also checks a simulated
+allocation failure exits before rendering and cleans up EGL. Native `1c74dee`
+accepts the mapping and completes shader setup, but its first full-frame readback
+returns `GL_OUT_OF_MEMORY`; the app closes normally. Driver `c53925e` moves large
+color/depth staging to owned CPU mappings: the unchanged full-frame control then
+passes 180 frames and all 2,596 probes with clean teardown. The small checker
+remains the default; this does not establish general application-heap robustness.
+
+`PS5_SOKOL_HEAP_READBACK=1 make sokol-cube` restores the original 8,294,400-byte
+`malloc` before shader setup (mutually exclusive with mapped readback).
+Use `bash tools/test-sokol-cube-host.sh --heap` for its host oracle. The native
+builder now shares the CTS app's existing 128 MiB process-lifetime heap wrapper.
+Native `dd8d228` passes shader setup, 180 frames and all 2,596 probes with this
+original large-malloc pattern. No allocator is added to the host reference or
+silently injected by the standalone installed graphics SDK. This is not maximum
+heap-capacity or exhaustive OOM-recovery validation.
+
+The sample is MIT-licensed by Andre Weissflog; its bundled vecmath is used under
+Mattias Gustavsson's MIT option. See [notices](../../THIRD_PARTY_NOTICES.md).

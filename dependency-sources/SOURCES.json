@@ -1,0 +1,35 @@
+{
+  "ai_assisted": true,
+  "snapshots": [
+    {
+      "name": "PS5_Vulkan",
+      "revision": "f3cbf875f89978deae9f855b9be2610cec2818ae",
+      "url": "https://github.com/mihawk-99/PS5_Vulkan",
+      "files": 2098
+    },
+    {
+      "name": "PS5_PayloadSDK",
+      "revision": "95c08f27386fc698f6bbe21dde3030140a41d10b",
+      "url": "https://github.com/mihawk-99/PS5_PayloadSDK",
+      "files": 2056
+    },
+    {
+      "name": "native-app-boilerplate",
+      "revision": "881804f52f04f09b90341a8f7f1284e405f53c18",
+      "url": "https://github.com/blackbearreloaded/ps5-native-app-boilerplate",
+      "files": 139
+    },
+    {
+      "name": "libnfs",
+      "revision": "4379837536d9eac537810dc7b13071136049b22a",
+      "url": "https://github.com/sahlberg/libnfs",
+      "files": 245
+    },
+    {
+      "name": "OpenGL-compiler-source",
+      "revision": "6cb291abea32281571c49705735046425cf000fd",
+      "url": "https://github.com/blackbearreloaded/ps5-opengl",
+      "files": 532
+    }
+  ]
+}

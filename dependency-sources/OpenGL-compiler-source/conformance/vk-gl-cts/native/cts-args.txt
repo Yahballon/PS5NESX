@@ -1,0 +1,16 @@
+# One argument per line. Keep every hardware launch explicitly bounded.
+--deqp-archive-dir=/app0
+--deqp-log-filename=/download0/ps5-opengl-cts.qpa
+--deqp-case=KHR-GL46.info.*
+--deqp-surface-type=pbuffer
+--deqp-surface-width=64
+--deqp-surface-height=64
+--deqp-screen-rotation=unspecified
+--deqp-base-seed=1
+--deqp-terminate-on-device-lost=disable
+--deqp-terminate-on-fail=enable
+--deqp-watchdog=disable
+--deqp-crashhandler=disable
+--deqp-log-images=disable
+--deqp-log-shader-sources=disable
+--deqp-log-flush=enable

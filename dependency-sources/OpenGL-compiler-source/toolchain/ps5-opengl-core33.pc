@@ -1,0 +1,13 @@
+# PS5 OpenGL - OpenGL implementation for PlayStation 5.
+# Copyright (C) 2026 BlackBearReloaded
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+prefix=${pcfiledir}/../..
+includedir=${prefix}/include
+libdir=${prefix}/lib
+
+Name: PS5 OpenGL Core 3.3 compatibility alias
+Description: Legacy package name for the PS5 OpenGL 4.6 Core runtime
+Version: 0.3.0
+Cflags: -DGL_GLEXT_PROTOTYPES=1 -I${includedir}
+Libs: -Wl,-u,ps5_agc_gate2_run -L${libdir} -Wl,--start-group -lPS5OpenGLCore33 -Wl,--end-group ${libdir}/libSceAgc.so ${libdir}/libSceAgcDriver.so -lSceVideoOut -lkernel_web -lSceSystemService

@@ -1,0 +1,17 @@
+# PS5NES feature requests (AI-assisted)
+name: Feature request
+description: Suggest an improvement to PS5NES.
+title: "[Feature] "
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem would this solve?
+    validations:
+      required: true
+  - type: textarea
+    id: solution
+    attributes:
+      label: Proposed behavior
+    validations:
+      required: true

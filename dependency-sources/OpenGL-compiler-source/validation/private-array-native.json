@@ -1,0 +1,20 @@
+{
+  "scope": "Test-only bounded private-array lowering; not general scratch support",
+  "source_commit": "e09252bce60650793aa9ca6d7413ac356ed903a1",
+  "gate": "egl_public_private_array.o",
+  "eboot_sha256": "ba60cc158b0f22b95fac910649cc985d618515239d7f1c030df303b739ab8c6b",
+  "receipt_sha256": "0498f17d4c9a6038206330bde2073bdbcc43e33fe05986ddb6e8ecb67dc8165d",
+  "receipt": "results/opengl46-private-array-v1/PPSA99005-20260911-220724-opengl.log",
+  "private_bytes": [16, 32, 64, 128],
+  "results_per_case": 1024,
+  "post_control_results": 1024,
+  "input_checks_per_case": 1024,
+  "guard_checks_per_case": 128,
+  "final_scratch_bytes": 0,
+  "outcome": "pass",
+  "teardown": "runtime-layers-released",
+  "services_healthy": true,
+  "owned_lock_released": true,
+  "ui_visually_verified": false,
+  "production_lowering_enabled": false
+}

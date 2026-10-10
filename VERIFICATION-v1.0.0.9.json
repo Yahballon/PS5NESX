@@ -1,0 +1,8 @@
+{
+  "ai_assisted": true,
+  "native_build": "passed",
+  "internal_metadata_denial_scanner_and_read": "passed",
+  "local_usb_nfs_cache_regression": "passed",
+  "rom_path_vulkan_preview": "passed",
+  "console_retest_required": true
+}

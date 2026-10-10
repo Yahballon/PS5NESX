@@ -1,0 +1,2935 @@
+/*
+ * PS5 Vulkan driver - queue submission.
+ * Copyright (C) 2026 Mihawk-99
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ *
+ * Milestone 5 Phase B5 (docs/M5_PHASE_B.md). Submission runs in Mesa's
+ * immediate mode (the only sync type has no timeline):
+ * 1. wait for the submission's input syncs (semaphores);
+ * 2. copy the command buffers' PM4 words into the queue's GPU-visible
+ *    submission buffer;
+ * 3. end the stream as ps5-opengl ends a frame it does not present: the
+ *    colour-buffer barrier, then a completion marker that writes a value unique
+ *    to this step into the buffer's last word (Phase B4);
+ * 4. submit with sceAgcDriverSubmitDcb and pass sceAgcSuspendPoint;
+ * 5. signal the output syncs (fences and semaphores) with the marker value
+ *    they wait for.
+ * R69: the last step is not waited for. The console starts a submission up to a
+ * refresh after it is made (docs/HARDWARE_FINDINGS.md, R68), so a queue that
+ * waited for each one ran at most one submission a refresh. The marker is a
+ * rising count instead of a flag; a sync signalled by a submission holds once
+ * the marker reaches its value (ps5vk_sync.c), and what the CPU reads of the
+ * GPU's work -- a fence's memory, a query pool, the source of a CPU copy --
+ * waits for that value first (ps5vk_queue_wait_value). The marker poll is the
+ * test runner's: flush the cache line, compare, spin briefly, then sleep 1 ms,
+ * for up to 2 s without progress. Streams follow one another in the buffer
+ * while earlier ones may still run (ps5vk_queue_stream_base).
+ * A command buffer's copies (vkCmdCopyBuffer, Phase C2, ps5vk_cmd_buffer.c) are
+ * CPU memcpys: memory is shared, so the submission is split at each copy -- the
+ * words before it run and are waited for (with every submission before them),
+ * the CPU copies, and the words after it run next -- which keeps Vulkan's
+ * command order. A draw that samples a target an
+ * earlier draw in the same command buffer rendered into splits the submission
+ * the same way, with no copy to run: the colour flush such a draw carries is
+ * not a wait, so the step boundary and its marker are what let the sample see
+ * the render (ps5vk_draw.c, ps5vk_cmd_buffer_split).
+ * CPU and GPU share memory, and the colour targets the command buffers render
+ * to stay mapped for the application, so their CPU cache lines are evicted
+ * before submission, keeping a CPU write from reaching memory after the
+ * GPU's, and again once the marker passes the step, so the CPU reads what the
+ * GPU wrote; the test runner flushes its targets the same way (flush_gpu_data).
+ * A submission without command buffers has nothing for the GPU and only
+ * signals. A marker that never arrives loses the device.
+ *
+ * Console runs (docs/M5_PHASE_B.md): a stream of only the barrier and marker
+ * completes, so empty command buffers work (pid 107), and the marker arrives
+ * after the last draw has rendered (pid 108, b5-order), so a fence signalled
+ * here is safe for readback. The suspend point takes ~125 µs whatever the
+ * stream holds; heavier work than seen so far may need later polls.
+ *
+ * The GPU may read what a submission points at until its marker value is
+ * reached; Vulkan's own rules (a command buffer is reset or freed, and a
+ * resource destroyed, only once its submissions have completed) keep the
+ * application from changing it before then.
+ *
+ * Presentation (Phase C1, run pid 134): a submission rendering into a
+ * swapchain image starts with that image's wait packet, and a present
+ * submits the image's flip alone (ps5vk_queue_flip, called from
+ * ps5vk_wsi.c).
+ */
+
+#include "ps5vk_private.h"
+#include "ps5vk_debug.h"
+
+#include "vk_format.h"
+
+#include <assert.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <pthread.h>
+#include <stdatomic.h>
+#include <immintrin.h>
+
+#include "util/os_time.h"
+#include "ps5vk_thread.h"
+
+/* One 2 MiB GPU-visible buffer per queue; its last word is the marker. */
+#define PS5VK_SUBMISSION_BYTES UINT64_C(0x200000)
+
+/* ps5-opengl's colour-buffer barrier (event 45, control 12) and completion
+ * marker (event 40, control 0x30c), as the test runner encodes them; each
+ * packet is 8 words (golden/b4). The driver's completion is the same packet
+ * with event 20, CACHE_FLUSH_AND_INV_TS_EVENT (R90, ps5vk_queue_run_step). */
+#define PS5VK_BARRIER_EVENT 45
+#define PS5VK_BARRIER_CONTROL 12
+#define PS5VK_COMPLETION_EVENT 20
+#define PS5VK_COMPLETION_CONTROL 0x30c
+#define PS5VK_COMPLETION_WORDS 8
+#define PS5VK_STREAM_END_WORDS 16
+/* The profile's stamp slots (struct ps5vk_queue, stamps). */
+#define PS5VK_STAMP_START 0
+#define PS5VK_STAMP_WAITED 1
+#define PS5VK_STAMP_END 2
+#define PS5VK_STAMP_BYTES UINT64_C(0x10000)
+#define PS5VK_STAMP_TICK_NS 10
+
+/* The test runner's marker wait: 1 ms sleeps for up to 2 s. */
+#define PS5VK_MARKER_POLLS 2000
+#define PS5VK_MARKER_POLL_MICROSECONDS 1000
+/* Before the first of those sleeps, the marker is checked in a loop for up to
+ * this long. R36 measured every E1M1 step missing the marker at the first check
+ * and finding it after one 1 ms sleep, which costs a system call (~20 us here)
+ * and the sleep's whole granularity for a GPU that is done well inside it. The
+ * spin is bounded, and past it the wait is exactly the sleeping one it was. */
+#define PS5VK_MARKER_SPIN_NS UINT64_C(1500000)
+
+/* R68's submission modes (PS5VK_AB_SUBMIT_CYCLE): 0 passes a suspend point
+ * after every submission, as the driver always has; 1 after flips only; 2
+ * after none; 3 after flips only, with the work submitted with its
+ * description's flag byte set; 4 the flag with a suspend point after every
+ * submission. A step submitted without one whose marker has not arrived after
+ * this many 1 ms sleeps passes one then, so no mode can hang the queue; a
+ * flagged submission the driver refuses is submitted again without the flag. */
+#define PS5VK_SUSPEND_MODES 5u
+#define PS5VK_RESCUE_POLLS 20u
+
+/* R31's attribution of the application's own time. Each instrumented entry
+ * point closes the stretch since the previous one returned and opens its own, so
+ * the stretches partition the wall clock that the queue and flip intervals do
+ * not cover.
+ *
+ * The stretch chain is deliberately NOT per thread. The engine records a frame
+ * on one thread and presents it on another (r_tasks 1), and a per-thread chain
+ * then measures two overlapping wall-clock stretches, so their sum exceeds the
+ * frame it is meant to partition -- measured at 929 ms of "named" time in a
+ * 50 ms frame when this was tried. One shared chain keeps the partition exact
+ * at the cost of attributing a stretch to whichever thread called next; the
+ * totals are what to read, not the labels.
+ *
+ * The *call* pairing can be per thread, because an enter and its leave are the
+ * same call on the same thread. That is what separates the driver's own time
+ * from the application's: without it, a stretch that is long because a call is
+ * long reads as application work. */
+static _Thread_local uint64_t ps5vk_profile_call_from;
+
+/* The hitch counters: process-wide, because the calls they count reach no
+ * queue, and armed with the profile. */
+static bool ps5vk_hitch_armed;
+static uint64_t ps5vk_hitch_calls[PS5VK_HITCH_KINDS];
+static uint64_t ps5vk_hitch_ns[PS5VK_HITCH_KINDS];
+static const char *const ps5vk_hitch_names[PS5VK_HITCH_KINDS] = {
+   "pipelines", "compiles", "memory", "images", "buffers", "descriptors", "modules",
+};
+
+uint64_t
+ps5vk_hitch_begin(void)
+{
+   return ps5vk_hitch_armed ? ps5vk_profile_now() : 0;
+}
+
+void
+ps5vk_hitch_end(enum ps5vk_hitch_kind kind, uint64_t begun)
+{
+   if (begun == 0)
+      return;
+   p_atomic_inc(&ps5vk_hitch_calls[kind]);
+   p_atomic_add(&ps5vk_hitch_ns[kind], ps5vk_profile_now() - begun);
+}
+
+/* A present whose period exceeds this is a hitch, and gets a line of its own:
+ * that frame's share of the application, queue, copy and flip time and of
+ * every hitch counter. At most this many lines a window, each one write. */
+#define PS5VK_HITCH_NS UINT64_C(40000000)
+#define PS5VK_HITCH_LINES 20
+
+static void
+ps5vk_hitch_frame(struct ps5vk_queue_profile *p, uint64_t period)
+{
+   const uint64_t app = p->app_pre_submit_ns + p->app_pre_present_ns;
+   uint64_t calls[PS5VK_HITCH_KINDS], ns[PS5VK_HITCH_KINDS];
+   for (unsigned k = 0; k < PS5VK_HITCH_KINDS; k++) {
+      calls[k] = p_atomic_read(&ps5vk_hitch_calls[k]);
+      ns[k] = p_atomic_read(&ps5vk_hitch_ns[k]);
+   }
+   if (period > PS5VK_HITCH_NS) {
+      p->hitches++;
+      if (p->hitch_lines < PS5VK_HITCH_LINES) {
+         p->hitch_lines++;
+         char line[512];
+         int at = snprintf(line, sizeof(line),
+                           "[ps5vk] hitch period_ms=%.3f app_ms=%.3f queue_ms=%.3f copy_ms=%.3f "
+                           "flip_ms=%.3f",
+                           (double)period / 1e6, (double)(app - p->frame_app_ns) / 1e6,
+                           (double)(p->queue_ns - p->frame_queue_ns) / 1e6,
+                           (double)(p->copy_ns - p->frame_copy_ns) / 1e6,
+                           (double)(p->flip_ns - p->frame_flip_ns) / 1e6);
+         for (unsigned k = 0; k < PS5VK_HITCH_KINDS && at > 0 && (size_t)at < sizeof(line); k++)
+            at += snprintf(line + at, sizeof(line) - (size_t)at, " %s=%" PRIu64 "/%.3fms",
+                           ps5vk_hitch_names[k], calls[k] - p->frame_hitch_calls[k],
+                           (double)(ns[k] - p->frame_hitch_ns[k]) / 1e6);
+         if (at > 0 && (size_t)at < sizeof(line) - 1) {
+            line[at++] = '\n';
+            fflush(stderr);
+            const int descriptor = fileno(stderr);
+            if (descriptor >= 0)
+               (void)!write(descriptor, line, (size_t)at);
+         }
+      }
+   }
+   p->frame_app_ns = app;
+   p->frame_queue_ns = p->queue_ns;
+   p->frame_copy_ns = p->copy_ns;
+   p->frame_flip_ns = p->flip_ns;
+   memcpy(p->frame_hitch_calls, calls, sizeof(calls));
+   memcpy(p->frame_hitch_ns, ns, sizeof(ns));
+}
+
+uint64_t
+ps5vk_profile_now(void)
+{
+   /* Written once with the same value by whichever thread gets here first. */
+   static uint64_t hz;
+   if (hz == 0) {
+      const uint64_t reported = sceKernelGetTscFrequency();
+      hz = reported > 1 ? reported : UINT64_MAX;
+   }
+   if (hz == UINT64_MAX)
+      return os_time_get_nano();
+   return (uint64_t)((unsigned __int128)sceKernelReadTsc() * UINT64_C(1000000000) / hz);
+}
+
+void
+ps5vk_profile_enter(struct ps5vk_queue *queue, unsigned slot)
+{
+   struct ps5vk_queue_profile *const p = &queue->profile;
+   if (!p->enabled)
+      return;
+   const uint64_t now = ps5vk_profile_now();
+   if (slot >= PS5VK_PROFILE_SLOTS)
+      slot = PS5VK_PROFILE_AFTER_PRESENT;
+   if (p->gap_from_ns != 0 && now > p->gap_from_ns) {
+      p->gap_ns[p->gap_slot] += now - p->gap_from_ns;
+      p->gap_count[p->gap_slot]++;
+   }
+   p->gap_from_ns = 0;
+   p->gap_slot = slot;
+   ps5vk_profile_call_from = now;
+}
+
+void
+ps5vk_profile_leave(struct ps5vk_queue *queue, unsigned slot)
+{
+   struct ps5vk_queue_profile *const p = &queue->profile;
+   if (!p->enabled || slot >= PS5VK_PROFILE_SLOTS)
+      return;
+   const uint64_t now = ps5vk_profile_now();
+   if (ps5vk_profile_call_from != 0 && now > ps5vk_profile_call_from)
+      p->call_ns[slot] += now - ps5vk_profile_call_from;
+   ps5vk_profile_call_from = 0;
+   p->gap_from_ns = now;
+   p->gap_slot = slot;
+}
+
+/* What the profile's own timestamps cost, and what the alternatives would: one
+ * line, once, when profiling is enabled. Each source is called PROBE_CALLS times
+ * between two os_time_get_nano reads, so the bracket's own cost is spread over
+ * all of them. getpid is a plain system call and the mutex pair an uncontended
+ * one, so the line also says whether a slow clock is the clock or every call
+ * into the kernel. */
+#define PS5VK_PROBE_CALLS 10000u
+static void
+ps5vk_queue_probe_costs(struct ps5vk_queue_profile *p)
+{
+   volatile uint64_t sink = 0;
+   uint64_t from = os_time_get_nano();
+   for (unsigned i = 0; i < PS5VK_PROBE_CALLS; i++)
+      sink += os_time_get_nano();
+   const uint64_t clock_ns = os_time_get_nano() - from;
+   from = os_time_get_nano();
+   for (unsigned i = 0; i < PS5VK_PROBE_CALLS; i++)
+      sink += sceKernelReadTsc();
+   const uint64_t tsc_ns = os_time_get_nano() - from;
+   from = os_time_get_nano();
+   for (unsigned i = 0; i < PS5VK_PROBE_CALLS; i++)
+      sink += sceKernelGetProcessTimeCounter();
+   const uint64_t counter_ns = os_time_get_nano() - from;
+   from = os_time_get_nano();
+   for (unsigned i = 0; i < PS5VK_PROBE_CALLS; i++)
+      sink += (uint64_t)getpid();
+   const uint64_t getpid_ns = os_time_get_nano() - from;
+   mtx_t lock;
+   mtx_init(&lock, mtx_plain);
+   from = os_time_get_nano();
+   for (unsigned i = 0; i < PS5VK_PROBE_CALLS; i++) {
+      mtx_lock(&lock);
+      mtx_unlock(&lock);
+   }
+   const uint64_t mutex_ns = os_time_get_nano() - from;
+   mtx_destroy(&lock);
+   /* Two TSC reads a known sleep apart: whether the counter ticks at the rate
+    * the kernel reports is what would make it usable as a clock. */
+   const uint64_t tsc_from = sceKernelReadTsc();
+   const uint64_t wall_from = os_time_get_nano();
+   sceKernelUsleep(20000);
+   const uint64_t tsc_ticks = sceKernelReadTsc() - tsc_from;
+   const uint64_t wall_ns = os_time_get_nano() - wall_from;
+   p->clock_ns_x1000 = clock_ns / (PS5VK_PROBE_CALLS / 1000u);
+   char line[512];
+   snprintf(line, sizeof(line),
+            "[ps5vk] cost probe calls=%u clock_gettime_ns=%.1f read_tsc_ns=%.1f "
+            "process_time_counter_ns=%.1f getpid_ns=%.1f mutex_pair_ns=%.1f "
+            "tsc_hz=%" PRIu64 " tsc_ticks=%" PRIu64 " over_ns=%" PRIu64 " sink=%" PRIu64 "\n",
+            PS5VK_PROBE_CALLS, (double)clock_ns / PS5VK_PROBE_CALLS,
+            (double)tsc_ns / PS5VK_PROBE_CALLS, (double)counter_ns / PS5VK_PROBE_CALLS,
+            (double)getpid_ns / PS5VK_PROBE_CALLS, (double)mutex_ns / PS5VK_PROBE_CALLS,
+            sceKernelGetTscFrequency(), tsc_ticks, wall_ns, (uint64_t)(sink & 1u));
+   fputs(line, stderr);
+}
+
+struct ps5vk_queue *
+ps5vk_device_profile_queue(struct ps5vk_device *device)
+{
+   return device != NULL && device->queue_initialized ? &device->queue : NULL;
+}
+
+uint8_t
+ps5vk_agc_out_of_space(struct ps5vk_agc_command_buffer *buffer, uint32_t words, void *user_data)
+{
+   (void)buffer;
+   (void)words;
+   (void)user_data;
+   return 0;
+}
+
+/* A target may be registered by several passes or query writes. Between
+ * entries in one flush operation no GPU or CPU copy runs, so an identical
+ * range needs eviction only once. Keep all records for their other users. */
+static bool
+ps5vk_target_already_flushed(const struct vk_queue_submit *submit, uint32_t buffer_index,
+                              const struct ps5vk_render_target *target)
+{
+   for (uint32_t i = 0; i <= buffer_index; i++) {
+      const struct ps5vk_cmd_buffer *const cmd_buffer =
+         container_of(submit->command_buffers[i], struct ps5vk_cmd_buffer, vk);
+      util_dynarray_foreach (&cmd_buffer->targets, struct ps5vk_render_target, earlier) {
+         if (i == buffer_index && earlier == target)
+            return false;
+         if (earlier->address == target->address && earlier->bytes == target->bytes)
+            return true;
+      }
+   }
+   return false;
+}
+
+/* Evicts every distinct target range the CPU can have cached outside the
+ * driver's own CPU paths, before and after each submission step: a query
+ * pool's counters, and colour targets in memory the application has mapped.
+ *
+ * A colour target in memory it never mapped is skipped. The CPU touches such a
+ * range only through this driver's copies, blits, resolves, clears and uploads,
+ * and each of those flushes what it wrote once it has written it and
+ * invalidates what it reads before reading it (the blits and resolves over
+ * their whole source image), so no line of it is dirty before a step or stale
+ * after one. That was measured as 256 MiB and 3.9 ms a frame at E1M1 (driver
+ * R36) for targets the game never maps. */
+static void
+ps5vk_queue_flush_targets(struct ps5vk_queue *queue, const struct vk_queue_submit *submit)
+{
+   const uint64_t started = queue->profile.enabled ? ps5vk_profile_now() : 0;
+   for (uint32_t i = 0; i < submit->command_buffer_count; i++) {
+      const struct ps5vk_cmd_buffer *const cmd_buffer =
+         container_of(submit->command_buffers[i], struct ps5vk_cmd_buffer, vk);
+      util_dynarray_foreach (&cmd_buffer->targets, struct ps5vk_render_target, target) {
+         if (!target->always && (target->memory == NULL || !target->memory->host_mapped))
+            continue;
+         if (ps5vk_target_already_flushed(submit, i, target))
+            continue;
+         ps5vk_flush_cpu_cache(target->address, target->bytes);
+         if (queue->profile.enabled)
+            queue->profile.flush_bytes += target->bytes;
+      }
+   }
+   if (queue->profile.enabled)
+      queue->profile.flush_ns += ps5vk_profile_now() - started;
+}
+
+/* R69: a range to evict from the CPU caches once the GPU has run the step
+ * whose marker value is value: what ps5vk_queue_flush_targets evicts after a
+ * step it waits for, kept for a step it does not. */
+struct ps5vk_retire_range {
+   uint32_t value;
+   const void *address;
+   size_t bytes;
+};
+
+/* Whether a marker at current has passed value: the count rises by one a step
+ * and wraps past zero, so the comparison is the difference's sign. */
+static bool
+ps5vk_marker_reached(uint32_t current, uint32_t value)
+{
+   return (int32_t)(current - value) >= 0;
+}
+
+/* Evicts the ranges the completed steps wrote. Called with the lock held. */
+static void
+ps5vk_queue_retire_locked(struct ps5vk_queue *queue)
+{
+   struct ps5vk_retire_range *const ranges = util_dynarray_begin(&queue->retire);
+   const unsigned count = util_dynarray_num_elements(&queue->retire, struct ps5vk_retire_range);
+   unsigned kept = 0;
+   for (unsigned i = 0; i < count; i++) {
+      if (ps5vk_marker_reached(queue->completed_value, ranges[i].value))
+         ps5vk_flush_cpu_cache(ranges[i].address, ranges[i].bytes);
+      else
+         ranges[kept++] = ranges[i];
+   }
+   queue->retire.size = kept * sizeof(struct ps5vk_retire_range);
+}
+
+/* Reads the marker once, records how far the GPU has come and evicts what that
+ * completed; returns the newest completed value. A marker outside the values
+ * in flight is not taken: nothing but the queue's own steps write it. */
+static uint32_t
+ps5vk_queue_poll(struct ps5vk_queue *queue)
+{
+   ps5vk_flush_cpu_cache(queue->marker, sizeof(*queue->marker));
+   const uint32_t seen = *(volatile const uint32_t *)queue->marker;
+   mtx_lock(&queue->lock);
+   if (ps5vk_marker_reached(seen, queue->completed_value) &&
+       ps5vk_marker_reached(queue->submitted_value, seen))
+      queue->completed_value = seen;
+   ps5vk_queue_retire_locked(queue);
+   const uint32_t completed = queue->completed_value;
+   mtx_unlock(&queue->lock);
+   return completed;
+}
+
+/* Keeps a step's post-run evictions (ps5vk_queue_flush_targets' ranges) for
+ * when the GPU reaches value. */
+static void
+ps5vk_queue_defer_targets(struct ps5vk_queue *queue, const struct vk_queue_submit *submit,
+                          uint32_t value)
+{
+   mtx_lock(&queue->lock);
+   for (uint32_t i = 0; i < submit->command_buffer_count; i++) {
+      const struct ps5vk_cmd_buffer *const cmd_buffer =
+         container_of(submit->command_buffers[i], struct ps5vk_cmd_buffer, vk);
+      util_dynarray_foreach (&cmd_buffer->targets, struct ps5vk_render_target, target) {
+         if (!target->always && (target->memory == NULL || !target->memory->host_mapped))
+            continue;
+         if (ps5vk_target_already_flushed(submit, i, target))
+            continue;
+         const struct ps5vk_retire_range range = {value, target->address, target->bytes};
+         util_dynarray_append(&queue->retire, range);
+      }
+   }
+   mtx_unlock(&queue->lock);
+}
+
+VkResult
+ps5vk_queue_wait_value(struct ps5vk_queue *queue, uint32_t value, uint64_t abs_timeout_ns)
+{
+   if (ps5vk_marker_reached(ps5vk_queue_poll(queue), value))
+      return VK_SUCCESS;
+   if (abs_timeout_ns == 0 || os_time_get_nano() >= abs_timeout_ns)
+      return VK_TIMEOUT;
+   /* The marker poll's shape: a bounded spin, then 1 ms sleeps, for up to two
+    * seconds of no progress. */
+   const uint64_t begun = ps5vk_profile_now();
+   VkResult result = VK_SUCCESS;
+   for (const uint64_t until = begun + PS5VK_MARKER_SPIN_NS;;) {
+      if (ps5vk_marker_reached(ps5vk_queue_poll(queue), value))
+         goto done;
+      if (ps5vk_profile_now() >= until)
+         break;
+      _mm_pause();
+   }
+   for (unsigned poll = 0;; poll++) {
+      if (ps5vk_marker_reached(ps5vk_queue_poll(queue), value))
+         goto done;
+      if (os_time_get_nano() >= abs_timeout_ns) {
+         result = VK_TIMEOUT;
+         goto done;
+      }
+      if (poll == PS5VK_MARKER_POLLS) {
+         result = vk_queue_set_lost(&queue->vk, "completion marker 0x%08x not written within 2 s",
+                                    value);
+         goto done;
+      }
+      sceKernelUsleep(PS5VK_MARKER_POLL_MICROSECONDS);
+   }
+done:
+   if (queue->profile.enabled) {
+      queue->profile.pending_waits++;
+      queue->profile.pending_wait_ns += ps5vk_profile_now() - begun;
+   }
+   return result;
+}
+
+VkResult
+ps5vk_queue_wait_idle(struct ps5vk_queue *queue)
+{
+   mtx_lock(&queue->lock);
+   const uint32_t value = queue->submitted_value;
+   mtx_unlock(&queue->lock);
+   return ps5vk_queue_wait_value(queue, value, UINT64_MAX);
+}
+
+VkResult
+ps5vk_queue_wait_range(struct ps5vk_queue *queue, const void *address, uint64_t bytes)
+{
+   const uint64_t low = (uint64_t)(uintptr_t)address;
+   bool found = false;
+   uint32_t value = 0;
+   mtx_lock(&queue->lock);
+   util_dynarray_foreach (&queue->retire, struct ps5vk_retire_range, range) {
+      const uint64_t start = (uint64_t)(uintptr_t)range->address;
+      if (start < low + bytes && low < start + range->bytes &&
+          (!found || ps5vk_marker_reached(range->value, value))) {
+         value = range->value;
+         found = true;
+      }
+   }
+   mtx_unlock(&queue->lock);
+   return found ? ps5vk_queue_wait_value(queue, value, UINT64_MAX) : VK_SUCCESS;
+}
+
+/* One split of a submission and the stream offset its step ends at: the words
+ * before that offset are submitted and waited for before the CPU copies, and
+ * the words after it are submitted afterwards (ps5vk_queue_run). The copies a
+ * command buffer recorded at one position share an offset, and they run in
+ * record order; a record with no copy is a synchronization split, which the
+ * wait alone does the work of (ps5vk_cmd_buffer_split). */
+struct ps5vk_copy_split {
+   uint32_t offset;
+   const struct ps5vk_memory_copy *copy;
+};
+
+/* One source texel decoded to the RGBA8 bytes a UNORM destination takes: what
+ * the sampler's fetch would return (Vulkan's fill-in rule for the channels a
+ * format does not have, which V0-formats measured) converted to eight-bit
+ * UNORM. An sRGB format's value is linearised, a SNORM one mapped from its
+ * signed range, a float one clamped; every format is one ps5vk_image.c's table
+ * reports a descriptor word for, and the recording refuses the rest by name
+ * before a blit is ever recorded. */
+static float
+ps5vk_half_to_float(uint16_t half)
+{
+   const uint32_t sign = (uint32_t)(half >> 15) << 31;
+   const uint32_t exponent = (half >> 10) & 0x1fu;
+   const uint32_t mantissa = half & 0x3ffu;
+   uint32_t bits;
+   if (exponent == 0)
+      bits = sign; /* A subnormal half is far below an eight-bit level. */
+   else if (exponent == 31)
+      bits = sign | 0x7f800000u; /* An infinity or a NaN clamps either way. */
+   else
+      bits = sign | ((exponent - 15u + 127u) << 23) | (mantissa << 13);
+   float value;
+   memcpy(&value, &bits, sizeof(value));
+   return value;
+}
+
+static uint8_t
+ps5vk_unorm8(float value)
+{
+   return (uint8_t)CLAMP((int32_t)floorf(CLAMP(value, 0.0f, 1.0f) * 255.0f + 0.5f), 0, 255);
+}
+
+/* The little-endian word a packed texel's bytes hold. */
+static uint32_t
+ps5vk_packed_word(const uint8_t *texel, unsigned bytes)
+{
+   uint32_t word = 0;
+   for (unsigned byte = 0; byte < bytes; byte++)
+      word |= (uint32_t)texel[byte] << (8u * byte);
+   return word;
+}
+
+/* An 11- or 10-bit float channel: five exponent bits over mantissa_bits, with
+ * the implicit one, which is the specification's rule (V0-formats). */
+static float
+ps5vk_float_channel_to_float(uint32_t raw, unsigned mantissa_bits)
+{
+   const uint32_t exponent = raw >> mantissa_bits;
+   const uint32_t mantissa = raw & ((1u << mantissa_bits) - 1u);
+   if (exponent == 0)
+      return 0.0f;
+   return (1.0f + (float)mantissa / (float)(1u << mantissa_bits)) *
+          ldexpf(1.0f, (int)exponent - 15);
+}
+
+static float
+ps5vk_sfloat32(const uint8_t *bytes)
+{
+   float value;
+   memcpy(&value, bytes, sizeof(value));
+   return value;
+}
+
+/* One integer component as eight-bit UNORM: an unsigned value scaled by the
+ * range its width has (0x40 of a byte stays 0x40, 0x4000 of a short and
+ * 0x40000000 of a word become 0x40 too), and a signed one through the same
+ * scale after its negative half is clamped to zero, which is the rule the
+ * console's own SNORM and sRGB blits follow for a value below zero. */
+static uint8_t
+ps5vk_integer8(uint32_t raw, unsigned bits, bool is_signed)
+{
+   if (is_signed) {
+      const int32_t value = (int32_t)(raw << (32u - bits)) >> (32u - bits);
+      if (value <= 0)
+         return 0;
+      return ps5vk_unorm8((float)value / (float)((UINT32_C(1) << (bits - 1u)) - 1u));
+   }
+   const uint32_t max = bits == 32 ? UINT32_MAX : (UINT32_C(1) << bits) - 1u;
+   return ps5vk_unorm8((float)raw / (float)max);
+}
+
+/* An integer family's texel: channels components of bits bits, little endian,
+ * red first. A channel the format does not have reads zero and alpha reads
+ * opaque, which is Vulkan's fill rule for a fetch and the rule the console's
+ * vertex probe measured (docs/HARDWARE_FINDINGS.md). */
+static bool
+ps5vk_integer_to_rgba8(const uint8_t *texel, unsigned bits, unsigned channels, bool is_signed,
+                       uint8_t rgba[4])
+{
+   const unsigned bytes = bits / 8u;
+   rgba[0] = rgba[1] = rgba[2] = 0;
+   rgba[3] = 255;
+   for (unsigned channel = 0; channel < channels; channel++) {
+      uint32_t raw = 0;
+      memcpy(&raw, texel + channel * bytes, bytes);
+      rgba[channel] = ps5vk_integer8(raw, bits, is_signed);
+   }
+   return true;
+}
+
+bool
+ps5vk_texel_to_rgba8(VkFormat format, const uint8_t *texel, uint8_t rgba[4])
+{
+   switch (format) {
+   case VK_FORMAT_R8G8B8A8_UNORM:
+      memcpy(rgba, texel, 4);
+      return true;
+   case VK_FORMAT_A8B8G8R8_UNORM_PACK32:
+      rgba[0] = texel[3];
+      rgba[1] = texel[2];
+      rgba[2] = texel[1];
+      rgba[3] = texel[0];
+      return true;
+   case VK_FORMAT_R8G8B8A8_SRGB:
+   case VK_FORMAT_A8B8G8R8_SRGB_PACK32:
+   case VK_FORMAT_B8G8R8A8_SRGB: {
+      /* The byte-reversed B8G8R8A8 form holds its channels R last; the packed
+       * A8B8G8R8 form's image memory is the R, G, B, A order its twin has
+       * (ps5vk_format.storage_reversed), so it decodes like the identity row. */
+      const bool blue_first = format == VK_FORMAT_B8G8R8A8_SRGB;
+      for (unsigned channel = 0; channel < 3; channel++) {
+         const uint8_t stored = texel[blue_first ? 2u - channel : channel];
+         const float value = (float)stored / 255.0f;
+         const float linear =
+            value <= 0.04045f ? value / 12.92f : powf((value + 0.055f) / 1.055f, 2.4f);
+         rgba[channel] = ps5vk_unorm8(linear);
+      }
+      rgba[3] = texel[3];
+      return true;
+   }
+   case VK_FORMAT_R8G8B8A8_SNORM:
+   case VK_FORMAT_A8B8G8R8_SNORM_PACK32: {
+      const bool packed = format == VK_FORMAT_A8B8G8R8_SNORM_PACK32;
+      /* An SNORM texel's value is its signed byte over 127, and the UNORM
+       * destination clamps the negative half to zero -- which is what the
+       * console's own fetch showed: a 0x20 byte (0.252) lands at 0x40. */
+      for (unsigned channel = 0; channel < 3; channel++) {
+         const int8_t stored = (int8_t)texel[packed ? 3u - channel : channel];
+         rgba[channel] = ps5vk_unorm8((float)stored / 127.0f);
+      }
+      rgba[3] = packed ? ps5vk_unorm8((float)(int8_t)texel[0] / 127.0f) : 255;
+      return true;
+   }
+   case VK_FORMAT_R8_UNORM:
+      rgba[0] = texel[0];
+      rgba[1] = 0;
+      rgba[2] = 0;
+      rgba[3] = 255;
+      return true;
+   case VK_FORMAT_R8G8_UNORM:
+      rgba[0] = texel[0];
+      rgba[1] = texel[1];
+      rgba[2] = 0;
+      rgba[3] = 255;
+      return true;
+   case VK_FORMAT_R16_UNORM:
+   case VK_FORMAT_R16G16_UNORM: {
+      const uint16_t *const values = (const uint16_t *)texel;
+      const unsigned channels = format == VK_FORMAT_R16G16_UNORM ? 2u : 1u;
+      for (unsigned channel = 0; channel < 4; channel++)
+         rgba[channel] = channel < channels ? (uint8_t)(values[channel] / 257u)
+                                            : (channel == 3 ? 255 : 0);
+      return true;
+   }
+   case VK_FORMAT_R16G16B16A16_UNORM: {
+      const uint16_t *const values = (const uint16_t *)texel;
+      for (unsigned channel = 0; channel < 4; channel++)
+         rgba[channel] = (uint8_t)(values[channel] / 257u);
+      return true;
+   }
+   case VK_FORMAT_R16_SFLOAT:
+   case VK_FORMAT_R16G16_SFLOAT: {
+      const uint16_t *const values = (const uint16_t *)texel;
+      const unsigned channels = format == VK_FORMAT_R16G16_SFLOAT ? 2u : 1u;
+      for (unsigned channel = 0; channel < 4; channel++)
+         rgba[channel] = channel < channels ? ps5vk_unorm8(ps5vk_half_to_float(values[channel]))
+                                            : (channel == 3 ? 255 : 0);
+      return true;
+   }
+   case VK_FORMAT_R16G16B16A16_SFLOAT: {
+      const uint16_t *const values = (const uint16_t *)texel;
+      for (unsigned channel = 0; channel < 4; channel++)
+         rgba[channel] = ps5vk_unorm8(ps5vk_half_to_float(values[channel]));
+      return true;
+   }
+   case VK_FORMAT_R32_SFLOAT:
+   case VK_FORMAT_R32G32_SFLOAT: {
+      const unsigned channels = format == VK_FORMAT_R32G32_SFLOAT ? 2u : 1u;
+      for (unsigned channel = 0; channel < 4; channel++)
+         rgba[channel] = channel < channels ? ps5vk_unorm8(ps5vk_sfloat32(texel + channel * 4u))
+                                            : (channel == 3 ? 255 : 0);
+      return true;
+   }
+   /* V0-formats' packed families: components that are not byte-aligned, so the
+    * decode is per format rather than a copy. The rules are the specification's
+    * and the sampler probe's console frames are what they are read against
+    * (run_vulkan_format_sample_frames); tools/packed-format-check.py decodes the
+    * same texels on the PC, and the blit case's readback is the colour both
+    * name (run_vulkan_blit_format_frames). */
+   case VK_FORMAT_R5G6B5_UNORM_PACK16: {
+      const uint32_t word = ps5vk_packed_word(texel, 2);
+      rgba[0] = ps5vk_unorm8((float)((word >> 11) & 0x1fu) / 31.0f);
+      rgba[1] = ps5vk_unorm8((float)((word >> 5) & 0x3fu) / 63.0f);
+      rgba[2] = ps5vk_unorm8((float)(word & 0x1fu) / 31.0f);
+      rgba[3] = 255;
+      return true;
+   }
+   case VK_FORMAT_A1R5G5B5_UNORM_PACK16: {
+      const uint32_t word = ps5vk_packed_word(texel, 2);
+      rgba[0] = ps5vk_unorm8((float)((word >> 10) & 0x1fu) / 31.0f);
+      rgba[1] = ps5vk_unorm8((float)((word >> 5) & 0x1fu) / 31.0f);
+      rgba[2] = ps5vk_unorm8((float)(word & 0x1fu) / 31.0f);
+      rgba[3] = (word & 0x8000u) != 0 ? 255 : 0;
+      return true;
+   }
+   case VK_FORMAT_B4G4R4A4_UNORM_PACK16: {
+      const uint32_t word = ps5vk_packed_word(texel, 2);
+      rgba[0] = ps5vk_unorm8((float)((word >> 4) & 0xfu) / 15.0f);
+      rgba[1] = ps5vk_unorm8((float)((word >> 8) & 0xfu) / 15.0f);
+      rgba[2] = ps5vk_unorm8((float)((word >> 12) & 0xfu) / 15.0f);
+      rgba[3] = ps5vk_unorm8((float)(word & 0xfu) / 15.0f);
+      return true;
+   }
+   case VK_FORMAT_A2B10G10R10_UNORM_PACK32: {
+      const uint32_t word = ps5vk_packed_word(texel, 4);
+      rgba[0] = ps5vk_unorm8((float)(word & 0x3ffu) / 1023.0f);
+      rgba[1] = ps5vk_unorm8((float)((word >> 10) & 0x3ffu) / 1023.0f);
+      rgba[2] = ps5vk_unorm8((float)((word >> 20) & 0x3ffu) / 1023.0f);
+      rgba[3] = ps5vk_unorm8((float)((word >> 30) & 0x3u) / 3.0f);
+      return true;
+   }
+   case VK_FORMAT_E5B9G9R9_UFLOAT_PACK32: {
+      const uint32_t word = ps5vk_packed_word(texel, 4);
+      const float scale = ldexpf(1.0f, (int)((word >> 27) & 0x1fu) - 15) / 512.0f;
+      rgba[0] = ps5vk_unorm8((float)(word & 0x1ffu) * scale);
+      rgba[1] = ps5vk_unorm8((float)((word >> 9) & 0x1ffu) * scale);
+      rgba[2] = ps5vk_unorm8((float)((word >> 18) & 0x1ffu) * scale);
+      rgba[3] = 255;
+      return true;
+   }
+   case VK_FORMAT_B10G11R11_UFLOAT_PACK32: {
+      const uint32_t word = ps5vk_packed_word(texel, 4);
+      rgba[0] = ps5vk_unorm8(ps5vk_float_channel_to_float(word & 0x7ffu, 6));
+      rgba[1] = ps5vk_unorm8(ps5vk_float_channel_to_float((word >> 11) & 0x7ffu, 6));
+      rgba[2] = ps5vk_unorm8(ps5vk_float_channel_to_float((word >> 22) & 0x3ffu, 5));
+      rgba[3] = 255;
+      return true;
+   }
+   case VK_FORMAT_R32G32B32A32_SFLOAT:
+      for (unsigned channel = 0; channel < 4; channel++)
+         rgba[channel] = ps5vk_unorm8(ps5vk_sfloat32(texel + channel * 4u));
+      return true;
+   /* The integer families the audit lists for BLIT_SRC: the same rule the
+    * sampled integer probes read, scaled to the eight-bit destination. */
+   case VK_FORMAT_R8_UINT:
+      return ps5vk_integer_to_rgba8(texel, 8, 1, false, rgba);
+   case VK_FORMAT_R8_SINT:
+      return ps5vk_integer_to_rgba8(texel, 8, 1, true, rgba);
+   case VK_FORMAT_R8G8_UINT:
+      return ps5vk_integer_to_rgba8(texel, 8, 2, false, rgba);
+   case VK_FORMAT_R8G8_SINT:
+      return ps5vk_integer_to_rgba8(texel, 8, 2, true, rgba);
+   case VK_FORMAT_R8G8B8A8_UINT:
+      return ps5vk_integer_to_rgba8(texel, 8, 4, false, rgba);
+   case VK_FORMAT_R8G8B8A8_SINT:
+      return ps5vk_integer_to_rgba8(texel, 8, 4, true, rgba);
+   case VK_FORMAT_A8B8G8R8_UINT_PACK32:
+      return ps5vk_integer_to_rgba8(texel, 8, 4, false, rgba);
+   case VK_FORMAT_A8B8G8R8_SINT_PACK32:
+      return ps5vk_integer_to_rgba8(texel, 8, 4, true, rgba);
+   case VK_FORMAT_R16_UINT:
+      return ps5vk_integer_to_rgba8(texel, 16, 1, false, rgba);
+   case VK_FORMAT_R16_SINT:
+      return ps5vk_integer_to_rgba8(texel, 16, 1, true, rgba);
+   case VK_FORMAT_R16G16_UINT:
+      return ps5vk_integer_to_rgba8(texel, 16, 2, false, rgba);
+   case VK_FORMAT_R16G16_SINT:
+      return ps5vk_integer_to_rgba8(texel, 16, 2, true, rgba);
+   case VK_FORMAT_R16G16B16A16_UINT:
+      return ps5vk_integer_to_rgba8(texel, 16, 4, false, rgba);
+   case VK_FORMAT_R16G16B16A16_SINT:
+      return ps5vk_integer_to_rgba8(texel, 16, 4, true, rgba);
+   case VK_FORMAT_R32_UINT:
+      return ps5vk_integer_to_rgba8(texel, 32, 1, false, rgba);
+   case VK_FORMAT_R32_SINT:
+      return ps5vk_integer_to_rgba8(texel, 32, 1, true, rgba);
+   case VK_FORMAT_R32G32_UINT:
+      return ps5vk_integer_to_rgba8(texel, 32, 2, false, rgba);
+   case VK_FORMAT_R32G32_SINT:
+      return ps5vk_integer_to_rgba8(texel, 32, 2, true, rgba);
+   case VK_FORMAT_R32G32B32A32_UINT:
+      return ps5vk_integer_to_rgba8(texel, 32, 4, false, rgba);
+   case VK_FORMAT_R32G32B32A32_SINT:
+      return ps5vk_integer_to_rgba8(texel, 32, 4, true, rgba);
+   case VK_FORMAT_A2B10G10R10_UINT_PACK32: {
+      uint32_t word = 0;
+      memcpy(&word, texel, sizeof(word));
+      rgba[0] = ps5vk_integer8(word & 0x3ffu, 10, false);
+      rgba[1] = ps5vk_integer8((word >> 10) & 0x3ffu, 10, false);
+      rgba[2] = ps5vk_integer8((word >> 20) & 0x3ffu, 10, false);
+      rgba[3] = ps5vk_integer8(word >> 30, 2, false);
+      return true;
+   }
+   /* The one- and two-channel signed-normalised forms, and the byte order
+    * VideoOut scans out: B first, so red is the third byte. */
+   case VK_FORMAT_R8_SNORM:
+      rgba[0] = ps5vk_unorm8((float)(int8_t)texel[0] / 127.0f);
+      rgba[1] = rgba[2] = 0;
+      rgba[3] = 255;
+      return true;
+   case VK_FORMAT_R8G8_SNORM:
+      rgba[0] = ps5vk_unorm8((float)(int8_t)texel[0] / 127.0f);
+      rgba[1] = ps5vk_unorm8((float)(int8_t)texel[1] / 127.0f);
+      rgba[2] = 0;
+      rgba[3] = 255;
+      return true;
+   case VK_FORMAT_B8G8R8A8_UNORM:
+      rgba[0] = texel[2];
+      rgba[1] = texel[1];
+      rgba[2] = texel[0];
+      rgba[3] = texel[3];
+      return true;
+   default:
+      return false;
+   }
+}
+
+/* One image clear, written on the CPU at the split point that recorded it: the
+ * encoded texel over every texel of the region, through the destination side's
+ * own map (the padded rows of a linear image, the measured tile map of a colour
+ * attachment). The touched bytes are flushed once, over the range they span,
+ * because the GPU reads what this wrote. */
+void
+ps5vk_clear_execute(const struct ps5vk_memory_copy *copy)
+{
+   const uint32_t texel_bytes = copy->destination_texel_bytes;
+   /* A four-sample destination clears every sample: its texel is four samples in
+    * four planes, each one a copy of the clear colour's four bytes (Phase C8). */
+   const uint32_t samples = copy->destination_side.samples == 4 ? 4u : 1u;
+   const uint32_t sample_bytes = texel_bytes / samples;
+   uint64_t low = UINT64_MAX;
+   uint64_t high = 0;
+   for (uint32_t row = 0; row < copy->height; row++) {
+      for (uint32_t column = 0; column < copy->width; column++) {
+         for (uint32_t sample = 0; sample < samples; sample++) {
+            const uint64_t at = ps5vk_image_copy_address(
+               &copy->destination_side, (int32_t)(copy->destination_x + column),
+               (int32_t)(copy->destination_y + row), sample_bytes, sample);
+            memcpy((void *)(uintptr_t)at, copy->clear_texel, sample_bytes);
+            low = MIN2(low, at);
+            high = MAX2(high, at + sample_bytes);
+         }
+      }
+   }
+   if (low < high)
+      ps5vk_flush_cpu_cache((const void *)(uintptr_t)low, (size_t)(high - low));
+}
+
+/* One resolve region: each destination texel takes the average of the four
+ * sample words of its source texel. A four-sample texel's four samples are four
+ * four-byte words in four 0x4000-byte planes, each at the texel's own swizzled
+ * position (ps5vk_image.c, ps5vk_image_copy_address), which is what the console
+ * measured; averaging is commutative, so which plane is which sample does not
+ * matter here, only that the four are the four of that texel. */
+static void
+ps5vk_resolve_execute(const struct ps5vk_memory_copy *copy)
+{
+   if (copy->source_span_bytes != 0)
+      ps5vk_flush_cpu_cache((const void *)(uintptr_t)copy->source_span,
+                            (size_t)copy->source_span_bytes);
+   const uint32_t sample_bytes = copy->source_texel_bytes / 4u;
+   uint64_t source_low = UINT64_MAX;
+   uint64_t source_high = 0;
+   uint64_t destination_low = UINT64_MAX;
+   uint64_t destination_high = 0;
+   for (uint32_t row = 0; row < copy->height; row++) {
+      for (uint32_t column = 0; column < copy->width; column++) {
+         uint8_t resolved[4] = {0, 0, 0, 0};
+         for (uint32_t byte = 0; byte < copy->destination_texel_bytes; byte++) {
+            uint32_t total = 0;
+            for (uint32_t sample = 0; sample < 4; sample++) {
+               const uint64_t source_at =
+                  ps5vk_image_copy_address(&copy->source_side, (int32_t)column, (int32_t)row,
+                                           sample_bytes, sample);
+               uint8_t value = 0;
+               memcpy(&value, (const void *)(uintptr_t)(source_at + byte), sizeof(value));
+               total += value;
+               source_low = MIN2(source_low, source_at);
+               source_high = MAX2(source_high, source_at + sample_bytes);
+            }
+            resolved[byte] = (uint8_t)((total + 2u) / 4u);
+         }
+         const uint64_t destination_at = ps5vk_image_copy_address(
+            &copy->destination_side, (int32_t)(copy->destination_x + column),
+            (int32_t)(copy->destination_y + row), copy->destination_texel_bytes, 0);
+         memcpy((void *)(uintptr_t)destination_at, resolved, copy->destination_texel_bytes);
+         destination_low = MIN2(destination_low, destination_at);
+         destination_high = MAX2(destination_high, destination_at + copy->destination_texel_bytes);
+      }
+   }
+   if (source_low < source_high)
+      ps5vk_flush_cpu_cache((const void *)(uintptr_t)source_low, (size_t)(source_high - source_low));
+   if (destination_low < destination_high)
+      ps5vk_flush_cpu_cache((const void *)(uintptr_t)destination_low,
+                            (size_t)(destination_high - destination_low));
+}
+
+/* One scaled blit region, resampled on the CPU at the split point that recorded
+ * it: the destination's texels take the source texels their sample points name,
+ * nearest or bilinear. Vulkan maps a destination texel's centre onto the source
+ * rectangle's edges -- so a 2x upscale lands each source texel's centre on a
+ * 2x2 block exactly -- and a sample outside the rectangle clamps to its edge,
+ * which is the clamp-to-edge sampling the driver's descriptors use.
+ *
+ * The blend is on the texel bytes, which the recording has already restricted
+ * to four-byte texels (and R8G8B8A8_UNORM for the filtered case,
+ * ps5vk_image.c). The touched ranges are flushed around the write: the GPU
+ * wrote the source and reads the destination. */
+static void
+ps5vk_blit_rows(struct ps5vk_blit_part *part)
+{
+   const struct ps5vk_memory_copy *const copy = part->copy;
+   const uint32_t source_texel_bytes = copy->source_texel_bytes;
+   const uint32_t destination_texel_bytes = copy->destination_texel_bytes;
+   const float left = (float)copy->source_x;
+   const float top = (float)copy->source_y;
+   const float right = left + copy->source_step_x * (float)copy->width;
+   const float bottom = top + copy->source_step_y * (float)copy->height;
+   /* The source rectangle's texel bounds, for the clamp. A mirrored step makes
+    * the right and bottom below the left and top, so both ends sort. */
+   const int32_t low_x = (int32_t)floorf(MIN2(left, right));
+   const int32_t low_y = (int32_t)floorf(MIN2(top, bottom));
+   const int32_t high_x = (int32_t)ceilf(MAX2(left, right)) - 1;
+   const int32_t high_y = (int32_t)ceilf(MAX2(top, bottom)) - 1;
+   uint64_t source_low = UINT64_MAX;
+   uint64_t source_high = 0;
+   uint64_t destination_low = UINT64_MAX;
+   uint64_t destination_high = 0;
+   /* Whatever happens below, the part reports the bytes it touched. */
+#define PS5VK_BLIT_REPORT()                                                                      \
+   do {                                                                                          \
+      part->source_low = source_low;                                                             \
+      part->source_high = source_high;                                                           \
+      part->destination_low = destination_low;                                                   \
+      part->destination_high = destination_high;                                                 \
+   } while (0)
+
+   for (uint32_t row = part->row_begin; row < part->row_end; row++) {
+      const float sample_y = top + ((float)row + 0.5f) * copy->source_step_y - 0.5f;
+      for (uint32_t column = 0; column < copy->width; column++) {
+         const float sample_x = left + ((float)column + 0.5f) * copy->source_step_x - 0.5f;
+         uint8_t texel[16] = {0};
+         uint8_t rgba[4] = {0, 0, 0, 0};
+         if (!copy->linear) {
+            const int32_t x = CLAMP((int32_t)floorf(sample_x + 0.5f), low_x, high_x);
+            const int32_t y = CLAMP((int32_t)floorf(sample_y + 0.5f), low_y, high_y);
+            const uint64_t at =
+               ps5vk_image_copy_address(&copy->source_side, x, y, source_texel_bytes, 0);
+            memcpy(texel, (const uint8_t *)(uintptr_t)at, source_texel_bytes);
+            source_low = MIN2(source_low, at);
+            source_high = MAX2(source_high, at + source_texel_bytes);
+            /* The sampler's fetch, converted to the destination's four bytes:
+             * the same format copies its words, and any other decode the
+             * recording has already accepted (ps5vk_texel_to_rgba8). */
+            if (!ps5vk_texel_to_rgba8(copy->source_format, texel, rgba))
+               {
+                  PS5VK_BLIT_REPORT();
+                  return;
+               }
+         } else {
+            /* Four texels around the sample point, each weighted by how close
+             * the point is to it. A sample outside the rectangle clamps, so a
+             * clamped pair is the same texel twice and the weights still add up
+             * to one. */
+            const float x0 = floorf(sample_x);
+            const float y0 = floorf(sample_y);
+            const float fx = sample_x - x0;
+            const float fy = sample_y - y0;
+            const int32_t ix0 = CLAMP((int32_t)x0, low_x, high_x);
+            const int32_t iy0 = CLAMP((int32_t)y0, low_y, high_y);
+            const int32_t ix1 = CLAMP((int32_t)x0 + 1, low_x, high_x);
+            const int32_t iy1 = CLAMP((int32_t)y0 + 1, low_y, high_y);
+            const uint64_t at[4] = {
+               ps5vk_image_copy_address(&copy->source_side, ix0, iy0, source_texel_bytes, 0),
+               ps5vk_image_copy_address(&copy->source_side, ix1, iy0, source_texel_bytes, 0),
+               ps5vk_image_copy_address(&copy->source_side, ix0, iy1, source_texel_bytes, 0),
+               ps5vk_image_copy_address(&copy->source_side, ix1, iy1, source_texel_bytes, 0),
+            };
+            const float weight[4] = {
+               (1.0f - fx) * (1.0f - fy),
+               fx * (1.0f - fy),
+               (1.0f - fx) * fy,
+               fx * fy,
+            };
+            for (unsigned tap = 0; tap < 4; tap++) {
+               source_low = MIN2(source_low, at[tap]);
+               source_high = MAX2(source_high, at[tap] + source_texel_bytes);
+            }
+            /* A filtered blit is between four-byte UNORM images, so the blend
+             * is on their bytes (ps5vk_image.c). */
+            for (uint32_t byte = 0; byte < 4; byte++) {
+               float value = 0.0f;
+               for (unsigned tap = 0; tap < 4; tap++)
+                  value += (float)((const uint8_t *)(uintptr_t)at[tap])[byte] * weight[tap];
+               rgba[byte] = (uint8_t)CLAMP((int32_t)floorf(value + 0.5f), 0, 255);
+            }
+         }
+         const uint64_t destination_at = ps5vk_image_copy_address(
+            &copy->destination_side, (int32_t)(copy->destination_x + column),
+            (int32_t)(copy->destination_y + row), destination_texel_bytes, 0);
+         const uint32_t encoded = ps5vk_rgba8_to_texel(copy->destination_format, rgba, texel);
+         if (encoded == 0)
+            {
+               PS5VK_BLIT_REPORT();
+               return;
+            }
+         memcpy((void *)(uintptr_t)destination_at, texel, encoded);
+         destination_low = MIN2(destination_low, destination_at);
+         destination_high = MAX2(destination_high, destination_at + destination_texel_bytes);
+      }
+   }
+   PS5VK_BLIT_REPORT();
+#undef PS5VK_BLIT_REPORT
+}
+
+/* Flushes what a part touched: the GPU wrote the source and reads the
+ * destination. */
+static void
+ps5vk_blit_part_flush(const struct ps5vk_blit_part *part)
+{
+   if (part->source_low < part->source_high)
+      ps5vk_flush_cpu_cache((const void *)(uintptr_t)part->source_low,
+                            (size_t)(part->source_high - part->source_low));
+   if (part->destination_low < part->destination_high)
+      ps5vk_flush_cpu_cache((const void *)(uintptr_t)part->destination_low,
+                            (size_t)(part->destination_high - part->destination_low));
+}
+
+/* One blit, on the calling thread: the whole region as one part. */
+void
+ps5vk_blit_execute(const struct ps5vk_memory_copy *copy)
+{
+   if (copy->source_span_bytes != 0)
+      ps5vk_flush_cpu_cache((const void *)(uintptr_t)copy->source_span,
+                            (size_t)copy->source_span_bytes);
+   struct ps5vk_blit_part part = {
+      .copy = copy,
+      .row_begin = 0,
+      .row_end = copy->height,
+   };
+   ps5vk_blit_rows(&part);
+   ps5vk_blit_part_flush(&part);
+}
+
+/* ---------------------------------------------------------------------------
+ * Blits in parallel. vkQuake generates every warp texture's mip chain with a
+ * linear vkCmdBlitImage per level, and this driver resamples blits on the CPU:
+ * R41 measured 2.3-8.2 ms a frame of it while walking the start map, enough to
+ * push the frame past the display's ~20.8 ms VRR window. The texels a part
+ * computes are exactly ps5vk_blit_execute's -- the same function over a range of
+ * rows -- so the output does not depend on how the rows are divided.
+ *
+ * Consecutive blit records at one split point form a wave while no two of them
+ * touch the same image: a later record may read what an earlier one wrote (the
+ * next mip level of the same image), and those stay in record order. A wave's
+ * records are cut into row ranges that a small pool of workers and the
+ * submitting thread take from a shared counter.
+ * ------------------------------------------------------------------------- */
+#define PS5VK_BLIT_WORKERS 4
+/* Rows below this are not worth another thread's wake-up. */
+#define PS5VK_BLIT_MIN_ROWS 16u
+
+struct ps5vk_blit_pool {
+   pthread_mutex_t lock;
+   pthread_cond_t wake;
+   pthread_t threads[PS5VK_BLIT_WORKERS];
+   unsigned started;
+   bool quit;
+   unsigned generation;
+   /* The published round: parts and count are written under the lock before
+    * generation moves, and a worker reads them only after it has seen that. */
+   struct ps5vk_blit_part *parts;
+   unsigned count;
+   _Atomic unsigned next;
+   _Atomic unsigned done;
+   /* Workers inside a round. They join under the lock when they wake, so the
+    * submitter, which waits for none, never republishes under one. */
+   _Atomic unsigned active;
+};
+
+static void
+ps5vk_blit_pool_run(struct ps5vk_blit_pool *pool)
+{
+   for (;;) {
+      const unsigned index = atomic_fetch_add(&pool->next, 1u);
+      if (index >= pool->count)
+         return;
+      ps5vk_blit_rows(&pool->parts[index]);
+      atomic_fetch_add(&pool->done, 1u);
+   }
+}
+
+static void *
+ps5vk_blit_worker(void *argument)
+{
+   struct ps5vk_blit_pool *const pool = argument;
+   pthread_mutex_lock(&pool->lock);
+   unsigned seen = pool->generation;
+   for (;;) {
+      while (!pool->quit && pool->generation == seen)
+         pthread_cond_wait(&pool->wake, &pool->lock);
+      if (pool->quit)
+         break;
+      seen = pool->generation;
+      atomic_fetch_add(&pool->active, 1u);
+      pthread_mutex_unlock(&pool->lock);
+      ps5vk_blit_pool_run(pool);
+      atomic_fetch_sub(&pool->active, 1u);
+      pthread_mutex_lock(&pool->lock);
+   }
+   pthread_mutex_unlock(&pool->lock);
+   return NULL;
+}
+
+/* The queue's pool, started on first use; NULL when no worker could start, in
+ * which case blits run on the calling thread. */
+static struct ps5vk_blit_pool *
+ps5vk_blit_pool_get(struct ps5vk_queue *queue)
+{
+   if (queue->blit_pool != NULL || queue->blit_pool_refused)
+      return queue->blit_pool;
+   struct ps5vk_blit_pool *const pool = calloc(1, sizeof(*pool));
+   if (pool == NULL || pthread_mutex_init(&pool->lock, NULL) != 0) {
+      free(pool);
+      queue->blit_pool_refused = true;
+      return NULL;
+   }
+   pthread_cond_init(&pool->wake, NULL);
+   for (unsigned i = 0; i < PS5VK_BLIT_WORKERS; i++) {
+      if (ps5vk_thread_create(&pool->threads[i], ps5vk_blit_worker, pool) != 0)
+         break;
+      pool->started++;
+   }
+   if (pool->started == 0) {
+      fputs("[ps5vk] blit workers refused; blits stay on the submitting thread\n", stderr);
+      pthread_cond_destroy(&pool->wake);
+      pthread_mutex_destroy(&pool->lock);
+      free(pool);
+      queue->blit_pool_refused = true;
+      return NULL;
+   }
+   queue->blit_pool = pool;
+   return pool;
+}
+
+static void
+ps5vk_blit_pool_destroy(struct ps5vk_queue *queue)
+{
+   struct ps5vk_blit_pool *const pool = queue->blit_pool;
+   if (pool == NULL)
+      return;
+   pthread_mutex_lock(&pool->lock);
+   pool->quit = true;
+   pthread_cond_broadcast(&pool->wake);
+   pthread_mutex_unlock(&pool->lock);
+   for (unsigned i = 0; i < pool->started; i++)
+      pthread_join(pool->threads[i], NULL);
+   pthread_cond_destroy(&pool->wake);
+   pthread_mutex_destroy(&pool->lock);
+   free(pool->parts);
+   free(pool);
+   queue->blit_pool = NULL;
+}
+
+static bool
+ps5vk_spans_overlap(uint64_t a, uint64_t a_bytes, uint64_t b, uint64_t b_bytes)
+{
+   return a < b + b_bytes && b < a + a_bytes;
+}
+
+/* Whether a blit record may not run beside the wave's records: it touches an
+ * image one of them touches, or it lacks the spans that would say. */
+static bool
+ps5vk_blit_conflicts(const struct ps5vk_memory_copy *copy, const struct ps5vk_copy_split *wave,
+                     unsigned count)
+{
+   if (copy->source_span_bytes == 0 || copy->destination_span_bytes == 0)
+      return true;
+   for (unsigned i = 0; i < count; i++) {
+      const struct ps5vk_memory_copy *const other = wave[i].copy;
+      if (other->source_span_bytes == 0 || other->destination_span_bytes == 0)
+         return true;
+      const uint64_t mine[2][2] = {{copy->source_span, copy->source_span_bytes},
+                                   {copy->destination_span, copy->destination_span_bytes}};
+      const uint64_t theirs[2][2] = {{other->source_span, other->source_span_bytes},
+                                     {other->destination_span, other->destination_span_bytes}};
+      for (unsigned a = 0; a < 2; a++)
+         for (unsigned b = 0; b < 2; b++)
+            if (ps5vk_spans_overlap(mine[a][0], mine[a][1], theirs[b][0], theirs[b][1]))
+               return true;
+   }
+   return false;
+}
+
+/* The rows each part of a blit takes: about two parts per thread, never fewer
+ * than PS5VK_BLIT_MIN_ROWS. */
+static uint32_t
+ps5vk_blit_part_rows(uint32_t height, unsigned threads)
+{
+   return MAX2(PS5VK_BLIT_MIN_ROWS, DIV_ROUND_UP(height, 2u * threads));
+}
+
+/* Runs a wave of independent blits, divided into row ranges, and returns false
+ * when it could not (no workers, no memory), leaving the caller to run them in
+ * turn. */
+static bool
+ps5vk_blit_wave_execute(struct ps5vk_queue *queue, const struct ps5vk_copy_split *wave,
+                        unsigned count)
+{
+   struct ps5vk_blit_pool *const pool = ps5vk_blit_pool_get(queue);
+   if (pool == NULL)
+      return false;
+   const unsigned threads = pool->started + 1u;
+   unsigned total = 0;
+   for (unsigned i = 0; i < count; i++) {
+      const struct ps5vk_memory_copy *const copy = wave[i].copy;
+      total += MAX2(1u, DIV_ROUND_UP(copy->height, ps5vk_blit_part_rows(copy->height, threads)));
+      ps5vk_flush_cpu_cache((const void *)(uintptr_t)copy->source_span,
+                            (size_t)copy->source_span_bytes);
+   }
+   /* The round is published under the lock and only while no worker is inside
+    * one: a worker that woke late for the previous round may still be reading
+    * the parts, which the realloc below would free under it. Workers join a
+    * round only under this lock, so none can start while it is held. */
+   pthread_mutex_lock(&pool->lock);
+   while (atomic_load(&pool->active) != 0) {
+      pthread_mutex_unlock(&pool->lock);
+      _mm_pause();
+      pthread_mutex_lock(&pool->lock);
+   }
+   struct ps5vk_blit_part *const parts = realloc(pool->parts, total * sizeof(*parts));
+   if (parts == NULL) {
+      pthread_mutex_unlock(&pool->lock);
+      return false;
+   }
+   pool->parts = parts;
+   unsigned at = 0;
+   for (unsigned i = 0; i < count; i++) {
+      const struct ps5vk_memory_copy *const copy = wave[i].copy;
+      const uint32_t rows = ps5vk_blit_part_rows(copy->height, threads);
+      uint32_t row = 0;
+      do {
+         parts[at++] = (struct ps5vk_blit_part){
+            .copy = copy,
+            .row_begin = row,
+            .row_end = MIN2(copy->height, row + rows),
+         };
+         row += rows;
+      } while (row < copy->height);
+   }
+   assert(at == total);
+   pool->count = total;
+   atomic_store(&pool->done, 0u);
+   atomic_store(&pool->next, 0u);
+   pool->generation++;
+   pthread_cond_broadcast(&pool->wake);
+   pthread_mutex_unlock(&pool->lock);
+   ps5vk_blit_pool_run(pool);
+   while (atomic_load(&pool->done) < total || atomic_load(&pool->active) != 0)
+      _mm_pause();
+   for (unsigned i = 0; i < total; i++)
+      ps5vk_blit_part_flush(&parts[i]);
+   return true;
+}
+
+/* Whether a submission passes a suspend point right after it: always, unless a
+ * profiled diagnostic run cycles R68's modes. */
+static bool
+ps5vk_queue_suspends(const struct ps5vk_queue *queue, bool flip)
+{
+   switch (queue->profile.suspend_mode) {
+   case 1:
+   case 3:
+      return flip;
+   case 2:
+      return false;
+   default:
+      return true;
+   }
+}
+
+/* The words a step ends with: the barrier and the marker, and while profiling
+ * the end timestamp before them. */
+static size_t
+ps5vk_queue_end_words(const struct ps5vk_queue *queue)
+{
+   return PS5VK_STREAM_END_WORDS + (queue->stamps.address != NULL ? PS5VK_TIMESTAMP_EVENT_WORDS : 0);
+}
+
+/* The GPU address of one of the profile's stamp slots. */
+static uint64_t
+ps5vk_queue_stamp_address(const struct ps5vk_queue *queue, unsigned slot)
+{
+   return (uint64_t)(uintptr_t)queue->stamps.address + slot * sizeof(uint64_t);
+}
+
+/* R67: splits a step's wall time by the GPU's clock. The first step of a
+ * submission carries a stamp before its swapchain wait packets and one after
+ * them, and every step one before its end packets, so wait is the time VideoOut
+ * held the target image, work the step's own work after it, and late whatever
+ * the wall time from the submission call to the marker holds beyond both: the
+ * GPU reaching the step late, or the marker being seen late (the marker spin,
+ * then 1 ms sleeps). The GPU clock is 100 MHz (V0-query's timestamp probe). */
+static void
+ps5vk_queue_profile_stamps(struct ps5vk_queue *queue, uint64_t step_ns)
+{
+   struct ps5vk_queue_profile *const p = &queue->profile;
+   const volatile uint64_t *const stamps = queue->stamps.address;
+   if (!queue->start_stamped) {
+      p->later_steps++;
+      p->later_step_ns += step_ns;
+      return;
+   }
+   queue->start_stamped = false;
+   ps5vk_flush_cpu_cache((const void *)stamps, 3 * sizeof(uint64_t));
+   const uint64_t start = stamps[PS5VK_STAMP_START];
+   const uint64_t waited = stamps[PS5VK_STAMP_WAITED];
+   const uint64_t end = stamps[PS5VK_STAMP_END];
+   if (start == 0 || waited < start || end < waited) {
+      p->stamp_missing++;
+      return;
+   }
+   const uint64_t wait_ns = (waited - start) * PS5VK_STAMP_TICK_NS;
+   const uint64_t work_ns = (end - waited) * PS5VK_STAMP_TICK_NS;
+   const uint64_t late_ns = step_ns > wait_ns + work_ns ? step_ns - wait_ns - work_ns : 0;
+   p->stamp_steps++;
+   p->stamp_wait_ns += wait_ns;
+   p->stamp_work_ns += work_ns;
+   p->stamp_late_ns += late_ns;
+   p->stamp_wait_max_ns = MAX2(p->stamp_wait_max_ns, wait_ns);
+   p->stamp_work_max_ns = MAX2(p->stamp_work_max_ns, work_ns);
+   p->stamp_late_max_ns = MAX2(p->stamp_late_max_ns, late_ns);
+}
+
+/* Submits the words [start, end) of the stream with the colour-buffer barrier
+ * and a completion marker: the whole submission when it has no copies, or one
+ * step of a submission the copies split. With wait, everything the step holds
+ * has run once this returns, so the caller may copy on the CPU
+ * (ps5vk_queue_run); a submission's last step is not waited for (R69), and
+ * what waits for it later is the marker value it leaves in submitted_value. */
+static VkResult
+ps5vk_queue_run_step(struct ps5vk_queue *queue, const struct vk_queue_submit *submit,
+                     uint32_t *const stream, size_t capacity, uint32_t *const marker,
+                     uint32_t start, uint32_t end, uint32_t *capture, bool wait)
+{
+   struct ps5vk_agc_command_buffer command = {
+      .bottom = stream + start,
+      .top = stream + capacity,
+      .up = stream + end,
+      .down = stream + capacity,
+      .callback = (uintptr_t)ps5vk_agc_out_of_space,
+   };
+   /* The marker word is a rising count that starts at zero (R69: it is no
+    * longer cleared before a step, since earlier steps may still write it), so
+    * no step carries zero. */
+   queue->marker_value = queue->marker_value == UINT32_MAX ? 1 : queue->marker_value + 1;
+   const uint32_t value = queue->marker_value;
+   if (queue->stamps.address != NULL) {
+      if (command.up + PS5VK_TIMESTAMP_EVENT_WORDS > command.top)
+         return vk_queue_set_lost(&queue->vk, "no room for the profile's end timestamp");
+      uint64_t *const stamps = queue->stamps.address;
+      stamps[PS5VK_STAMP_END] = 0;
+      ps5vk_flush_cpu_cache(&stamps[PS5VK_STAMP_END], sizeof(uint64_t));
+      ps5vk_timestamp_packet(command.up, ps5vk_queue_stamp_address(queue, PS5VK_STAMP_END));
+      command.up += PS5VK_TIMESTAMP_EVENT_WORDS;
+   }
+   const uint32_t *const barrier =
+      sceAgcCbReleaseMem(&command, PS5VK_BARRIER_EVENT, PS5VK_BARRIER_CONTROL, 1, 0, NULL, 0, 0,
+                         0, 1, 0, 0);
+   /* R90: the completion is one RELEASE_MEM of CACHE_FLUSH_AND_INV_TS_EVENT
+    * (event 20, index 5): the colour and depth caches are flushed, L2 is
+    * written back and invalidated (cache actions 0x30c), and only then is the
+    * marker written -- one packet, as RADV's fences are. The runner's helper
+    * packet is event 40, bottom of pipe, with the same actions: it flushed no
+    * depth cache, and its L2 writeback did not wait for the colour flush the
+    * barrier before it started, so a CPU copy at a split point read stale
+    * texels of what the step had just rendered (r90-image-clears, PID 230:
+    * the tail of 8-byte and one-byte colour clears, a fifth of a depth clear).
+    * The words are the helper's with the event changed, in the encoding R70's
+    * GPU barrier uses (ps5vk_gpu_barrier_words). */
+   uint32_t *const completion = command.up;
+   if (barrier != NULL && command.up + PS5VK_COMPLETION_WORDS <= command.top) {
+      const uint64_t marker_address = (uint64_t)(uintptr_t)marker;
+      const uint32_t packet[PS5VK_COMPLETION_WORDS] = {
+         UINT32_C(0xc0064900), /* PKT3 RELEASE_MEM, 7 body words */
+         ((uint32_t)PS5VK_COMPLETION_CONTROL << 12) | (5u << 8) | PS5VK_COMPLETION_EVENT,
+         UINT32_C(0x20000000), (uint32_t)marker_address, (uint32_t)(marker_address >> 32), value,
+         0, 0,
+      };
+      memcpy(completion, packet, sizeof(packet));
+      command.up += PS5VK_COMPLETION_WORDS;
+   }
+   /* Mesa's immediate submission does not mark the queue lost when
+    * driver_submit fails, so every failure after this point does. */
+   if (!barrier || command.up == completion || command.up > command.top)
+      return vk_queue_set_lost(&queue->vk, "the AGC helpers did not write the completion packets");
+   const uint32_t word_count = (uint32_t)(command.up - command.bottom);
+   /* The words stay in the stream until the next submission replaces them, and
+    * the runner's capture reads them there (ps5vk_debug_last_submission) --
+    * unless the submission is split, where the step after this one lands its
+    * own words on this step's end packets and the caller hands over a capture
+    * buffer for them (ps5vk_queue_run_copy_steps, ps5vk_debug_submission_steps).
+    */
+   if (capture != NULL) {
+      memcpy(capture, stream + start, (size_t)word_count * sizeof(uint32_t));
+      ps5vk_flush_cpu_cache(capture, (size_t)word_count * sizeof(uint32_t));
+   }
+   const uint32_t *const words = capture != NULL ? capture : stream + start;
+   queue->last_words = word_count;
+   queue->last_stream = words;
+   if (queue->step_count < PS5VK_MAX_SUBMISSION_STEPS) {
+      queue->steps[queue->step_count].stream = words;
+      queue->steps[queue->step_count].words = word_count;
+      queue->step_count++;
+   }
+   ps5vk_queue_flush_targets(queue, submit);
+   ps5vk_flush_cpu_cache(stream + start, word_count * sizeof(uint32_t));
+   ps5vk_flush_cpu_cache(marker, sizeof(*marker));
+
+   struct ps5vk_agc_submit_description description = {
+      .words = stream + start,
+      .word_count = word_count,
+   };
+   const uint64_t started = queue->profile.enabled ? ps5vk_profile_now() : 0;
+   mtx_lock(&queue->lock);
+   queue->submitted_value = value;
+   mtx_unlock(&queue->lock);
+   description.flag = queue->profile.suspend_mode >= 3 ? 1 : 0;
+   int32_t result = sceAgcDriverSubmitDcb(&description);
+   if (result != 0 && description.flag != 0) {
+      queue->profile.flag_refusals++;
+      description.flag = 0;
+      result = sceAgcDriverSubmitDcb(&description);
+   }
+   if (result != 0)
+      return vk_queue_set_lost(&queue->vk, "sceAgcDriverSubmitDcb failed: 0x%08x",
+                               (unsigned)result);
+   /* R68's modes apply to a step not waited for as well, which has no rescue
+    * of its own: without a suspend point the GPU starts it at the next vblank
+    * (docs/HARDWARE_FINDINGS.md), and a later wait for it finds it done. */
+   bool suspended = ps5vk_queue_suspends(queue, false);
+   if (suspended) {
+      result = sceAgcSuspendPoint();
+      if (result != 0)
+         return vk_queue_set_lost(&queue->vk, "sceAgcSuspendPoint failed: 0x%08x",
+                                  (unsigned)result);
+   }
+   /* Everything up to here is the submission call itself; the wait below is the
+    * driver's own polling, and the difference between the two is what says
+    * whether a "gpu" interval is the GPU or the check granularity. */
+   const uint64_t submitted = queue->profile.enabled ? ps5vk_profile_now() : 0;
+   if (!wait) {
+      /* Its evictions wait for the marker, and its stamps are not read: the
+       * next submission's first step writes them again. */
+      ps5vk_queue_defer_targets(queue, submit, value);
+      queue->start_stamped = false;
+      if (queue->profile.enabled) {
+         queue->profile.async_steps++;
+         queue->profile.submit_call_ns += submitted - started;
+      }
+      return VK_SUCCESS;
+   }
+   (void)marker;
+
+   /* The bounded spin: a marker seen here counts as found at the first check. */
+   for (const uint64_t until = ps5vk_profile_now() + PS5VK_MARKER_SPIN_NS;;) {
+      if (ps5vk_marker_reached(ps5vk_queue_poll(queue), value) || ps5vk_profile_now() >= until)
+         break;
+      _mm_pause();
+   }
+   for (unsigned poll = 0; poll < PS5VK_MARKER_POLLS; poll++) {
+      if (ps5vk_marker_reached(ps5vk_queue_poll(queue), value)) {
+         if (queue->profile.enabled) {
+            struct ps5vk_queue_profile *const p = &queue->profile;
+            const uint64_t now = ps5vk_profile_now();
+            p->steps++;
+            p->gpu_ns += now - started;
+            p->submit_call_ns += submitted - started;
+            p->poll_ns += now - submitted;
+            p->polls += poll;
+            p->poll_first_hits += poll == 0;
+            if (queue->stamps.address != NULL)
+               ps5vk_queue_profile_stamps(queue, now - started);
+         }
+         ps5vk_queue_flush_targets(queue, submit);
+         return VK_SUCCESS;
+      }
+      sceKernelUsleep(PS5VK_MARKER_POLL_MICROSECONDS);
+      if (!suspended && poll + 1 == PS5VK_RESCUE_POLLS) {
+         suspended = true;
+         queue->profile.rescues++;
+         result = sceAgcSuspendPoint();
+         if (result != 0)
+            return vk_queue_set_lost(&queue->vk, "sceAgcSuspendPoint failed: 0x%08x",
+                                     (unsigned)result);
+      }
+   }
+   return vk_queue_set_lost(&queue->vk, "completion marker 0x%08x not written within 2 s", value);
+}
+
+/* An event action recorded by vkCmdSetEvent and its neighbours (ps5vk_sync.c):
+ * the flag is in this process, so a set or a reset is a store under the event's
+ * lock, and a wait reads the flag under that lock, sleeps a millisecond and
+ * reads it again, which is the shape the completion marker poll has. The poll
+ * is what a host vkSetEvent on another thread is seen by, and its two-second
+ * bound is what makes an event nothing ever sets a lost device with its own
+ * reason instead of a hang.
+ *
+ * The sleep is os_time_sleep and not the sceKernelUsleep the marker poll uses:
+ * the PC runner's sceKernelUsleep does not wait at all (nothing on the PC
+ * completes asynchronously, host/ps5/ps5_host.cpp), while a host thread really
+ * can set an event on the PC, so this wait has to keep time on both. A
+ * condition variable would need fewer wakeups, but the runtime's c11 wrapper
+ * for a *timed* wait returns without waiting on this build: the first version
+ * of this wait polled two thousand times in 67 microseconds and lost the device
+ * before the host's set arrived, which driver/tests/vk_b5_events_test.c
+ * caught. */
+static VkResult
+ps5vk_event_execute(struct ps5vk_queue *queue, const struct ps5vk_memory_copy *record)
+{
+   struct ps5vk_event *const event = record->event;
+   const bool wait = record->event_action == PS5VK_EVENT_ACTION_WAIT;
+   for (unsigned poll = 0; poll < PS5VK_MARKER_POLLS; poll++) {
+      mtx_lock(&event->lock);
+      if (!wait) {
+         event->signaled = record->event_action == PS5VK_EVENT_ACTION_SET;
+         mtx_unlock(&event->lock);
+         return VK_SUCCESS;
+      }
+      const bool signaled = event->signaled;
+      mtx_unlock(&event->lock);
+      if (signaled)
+         return VK_SUCCESS;
+      os_time_sleep(PS5VK_MARKER_POLL_MICROSECONDS);
+   }
+   return vk_queue_set_lost(&queue->vk, "an event waited for was not set within %u ms",
+                            PS5VK_MARKER_POLLS * PS5VK_MARKER_POLL_MICROSECONDS / 1000);
+}
+
+/* Runs a submission's steps, split where its copies and synchronization splits
+ * fall (ps5vk_cmd_buffer_split): submit the words up to a split, wait for them,
+ * run the copies recorded there on the CPU, then submit the words after it, so
+ * a copy observes everything recorded before it and everything recorded after
+ * it observes the copy (docs/M5_REFERENCE.md, C2), and a draw after a split
+ * observes everything recorded before it (C4). The end packets of a step land
+ * on the first words of the step after it, so the words as they were built are
+ * kept aside and put back before each step runs. */
+/* One record the queue is about to run on the CPU, counted by kind for the
+ * profile's cpu_copies. */
+static void
+ps5vk_profile_cpu_copy(struct ps5vk_queue_profile *p, const struct ps5vk_memory_copy *copy)
+{
+   enum ps5vk_cpu_copy_kind kind = PS5VK_CPU_COPY_OTHER;
+   uint64_t bytes = 0;
+   const uint64_t texels = (uint64_t)copy->width * copy->height;
+   if (copy->image_write) {
+      kind = PS5VK_CPU_COPY_UPLOAD;
+      bytes = texels * copy->destination_texel_bytes;
+   } else if (copy->image_copy) {
+      kind = copy->source_side.tiled && !copy->destination_side.tiled ? PS5VK_CPU_COPY_READBACK
+                                                                      : PS5VK_CPU_COPY_IMAGE;
+      bytes = texels * copy->source_texel_bytes;
+   } else if (copy->blit) {
+      kind = PS5VK_CPU_COPY_BLIT;
+      bytes = texels * copy->destination_texel_bytes;
+   } else if (copy->resolve) {
+      kind = PS5VK_CPU_COPY_RESOLVE;
+      bytes = texels * copy->destination_texel_bytes;
+   } else if (copy->clear) {
+      kind = PS5VK_CPU_COPY_CLEAR;
+      bytes = texels * copy->destination_texel_bytes;
+   } else if (copy->query || copy->event_action != PS5VK_EVENT_ACTION_NONE) {
+      kind = PS5VK_CPU_COPY_OTHER;
+   } else if (copy->fill) {
+      kind = PS5VK_CPU_COPY_FILL;
+      bytes = copy->bytes;
+   } else {
+      kind = PS5VK_CPU_COPY_BYTES;
+      bytes = copy->bytes;
+   }
+   p->cpu_copies[kind]++;
+   p->cpu_copy_bytes[kind] += bytes;
+}
+
+/* The window's cpu_copies as kind:records/KiB, the kinds with none left out. */
+static const char *
+ps5vk_profile_cpu_copies(const struct ps5vk_queue_profile *p, char *text, size_t size)
+{
+   static const char *const names[PS5VK_CPU_COPY_KINDS] = {
+      "upload", "readback", "image", "blit", "resolve", "clear", "fill", "bytes", "other"};
+   size_t at = 0;
+   text[0] = '\0';
+   for (unsigned kind = 0; kind < PS5VK_CPU_COPY_KINDS; kind++) {
+      if (p->cpu_copies[kind] == 0)
+         continue;
+      const int wrote = snprintf(text + at, size - at, "%s%s:%" PRIu64 "/%" PRIu64,
+                                 at ? "," : "", names[kind], p->cpu_copies[kind],
+                                 p->cpu_copy_bytes[kind] / 1024);
+      if (wrote < 0 || (size_t)wrote >= size - at)
+         break;
+      at += (size_t)wrote;
+   }
+   return at ? text : "none";
+}
+
+static VkResult
+ps5vk_queue_run_copy_steps(struct ps5vk_queue *queue, const struct vk_queue_submit *submit,
+                           uint32_t *const stream, size_t capacity, uint32_t *const marker,
+                           uint32_t words, struct util_dynarray *splits)
+{
+   const struct ps5vk_copy_split *const split = util_dynarray_begin(splits);
+   const uint32_t split_count = util_dynarray_num_elements(splits, struct ps5vk_copy_split);
+   uint32_t *const saved = words != 0 ? malloc((size_t)words * sizeof(uint32_t)) : NULL;
+   if (words != 0 && saved == NULL)
+      return vk_errorf(queue, VK_ERROR_OUT_OF_HOST_MEMORY,
+                       "no memory for the words of a split submission");
+   if (saved != NULL)
+      memcpy(saved, stream, (size_t)words * sizeof(uint32_t));
+
+   /* One step's words stay whole in the stream only until the next one lands
+    * its end packets on them, so a split submission's capture keeps its own
+    * copy of every step, end packets included (ps5vk_queue_run_step,
+    * ps5vk_debug_submission_steps). It outlives this call: the runner's
+    * capture reads it until the next submission replaces it.
+    *
+    * The steps are the words before the first split, one step per split, and
+    * the words after the last one: at most split_count + 1 of them carry words,
+    * and each writes its own end packets -- so the buffer holds one step's end
+    * packets more than the split count alone suggests. Sizing it for the splits
+    * alone is what wrote PS5VK_STREAM_END_WORDS words past this allocation on
+    * every frame of a recording whose last split was followed by more words
+    * (R6: two render passes with the resolve recorded between them; the check
+    * below names that arithmetic instead of repeating it). */
+   const size_t capture_steps = (size_t)split_count + 1;
+   const size_t capture_words = (size_t)words + capture_steps * ps5vk_queue_end_words(queue);
+   if (queue->step_capture_words < capture_words) {
+      free(queue->step_capture);
+      queue->step_capture = malloc(capture_words * sizeof(uint32_t));
+      queue->step_capture_words = queue->step_capture == NULL ? 0 : capture_words;
+      if (queue->step_capture == NULL) {
+         free(saved);
+         return vk_errorf(queue, VK_ERROR_OUT_OF_HOST_MEMORY,
+                          "no memory for the words of a split submission's capture");
+      }
+   }
+   size_t capture_at = 0;
+   uint32_t start = 0;
+   uint32_t at = 0;
+   VkResult result = VK_SUCCESS;
+   while (at < split_count || start < words) {
+      /* This step ends where the next copy falls, or at the stream's end. */
+      const uint32_t end = at < split_count ? split[at].offset : words;
+      /* A step with no words is a copy and nothing for the GPU to do -- a
+       * command buffer that only records copies, which is the staging upload's
+       * first one. There is nothing to submit: the step before it has
+       * completed, or the queue is waited for below, so the copy runs then. Submitting
+       * it anyway would put an empty stream and its marker in front of the
+       * frame the capture reads. */
+      if (end != start) {
+         /* R6: the capture buffer holds one step's end packets per *split*, but
+          * a recording whose last split is followed by more words runs
+          * split_count + 1 steps, and the last step's end packets land past the
+          * buffer: a heap write of PS5VK_STREAM_END_WORDS words, which is what
+          * corrupted the heap of an application that records two render passes
+          * a frame (docs/M5_PHASE_C.md, R6). The check is here rather than only
+          * in the size below so that a future change to how steps are counted
+          * names itself instead of writing past the buffer. */
+         const size_t step_words = (size_t)(end - start) + ps5vk_queue_end_words(queue);
+         if (capture_at + step_words > queue->step_capture_words) {
+            fprintf(stderr, "[ps5vk] step capture overflow: %zu words at %zu, buffer %zu\n",
+                    step_words, capture_at, queue->step_capture_words);
+            result = vk_errorf(queue, VK_ERROR_UNKNOWN,
+                               "a split submission's step capture needs %zu words where the "
+                               "buffer holds %zu (%u words, %u splits)",
+                               capture_at + step_words, queue->step_capture_words, words,
+                               split_count);
+            break;
+         }
+         memcpy(stream + start, saved + start, (size_t)(end - start) * sizeof(uint32_t));
+         /* The step after the last split is the submission's last and is not
+          * waited for; every other one is, since copies follow it. */
+         result = ps5vk_queue_run_step(queue, submit, stream, capacity, marker, start, end,
+                                       queue->step_capture + capture_at, at < split_count);
+         if (result != VK_SUCCESS)
+            break;
+         /* The end packets of this step take the reserve the stream keeps for
+          * them, which is where the next step's copy starts. */
+         capture_at += (size_t)(end - start) + ps5vk_queue_end_words(queue);
+      }
+      /* Every copy recorded at this offset runs now, in record order: the GPU
+       * has finished the words before it and has not seen the words after. A
+       * record with no bytes is a split with no copy, which the step boundary
+       * and the marker waited for above have already done all the work of
+       * (a draw that samples a target this submission rendered into,
+       * ps5vk_draw.c). */
+      /* Copies with no step before them in this submission follow the
+       * submissions before it, which may still be running (R69); after a step
+       * this is already so, since the step was waited for. */
+      if (end == start && at < split_count) {
+         result = ps5vk_queue_wait_idle(queue);
+         if (result != VK_SUCCESS)
+            break;
+      }
+      const uint64_t copy_started = queue->profile.enabled ? ps5vk_profile_now() : 0;
+      for (; at < split_count && split[at].offset == end; at++) {
+         const struct ps5vk_memory_copy *const copy = split[at].copy;
+         if (queue->profile.enabled)
+            ps5vk_profile_cpu_copy(&queue->profile, copy);
+         if (copy->resolve) {
+            ps5vk_resolve_execute(copy);
+            continue;
+         }
+         if (copy->blit) {
+            /* The run of independent blits from here is one wave. */
+            unsigned wave = 1;
+            while (at + wave < split_count && split[at + wave].offset == end &&
+                   split[at + wave].copy->blit &&
+                   !ps5vk_blit_conflicts(split[at + wave].copy, &split[at], wave))
+               wave++;
+            const bool parallel = (wave > 1 || copy->height >= 2u * PS5VK_BLIT_MIN_ROWS) &&
+                                  !ps5vk_blit_conflicts(copy, NULL, 0) &&
+                                  ps5vk_blit_wave_execute(queue, &split[at], wave);
+            if (!parallel)
+               for (unsigned i = 0; i < wave; i++)
+                  ps5vk_blit_execute(split[at + i].copy);
+            for (unsigned i = 1; queue->profile.enabled && i < wave; i++)
+               ps5vk_profile_cpu_copy(&queue->profile, split[at + i].copy);
+            at += wave - 1;
+            continue;
+         }
+         /* An upload into tiled storage is a region of texels, not a range of
+          * bytes: every texel lives at the map's own place, so it too runs
+          * before the empty-copy check (C7). */
+         if (copy->image_write) {
+            ps5vk_image_write_execute(copy);
+            continue;
+         }
+         /* An image copy is the same shape: a region of one map's runs written
+          * at another's, with no bytes of its own. */
+         if (copy->image_copy) {
+            ps5vk_image_copy_execute(copy);
+            continue;
+         }
+         /* A clear is a region of an image, not a range of bytes: it has no
+          * bytes of its own, so it is dispatched before the empty-copy check. */
+         if (copy->clear) {
+            ps5vk_clear_execute(copy);
+            continue;
+         }
+         /* A query-result copy computes its bytes from the pool's counters
+          * rather than naming them, so it too runs before the empty-copy
+          * check (Phase V0-query). */
+         if (copy->query) {
+            ps5vk_query_execute(copy);
+            continue;
+         }
+         /* An event action carries no bytes either: it is the flag the command
+          * named, set, reset or waited for at this point in the order. */
+         if (copy->event_action != PS5VK_EVENT_ACTION_NONE) {
+            result = ps5vk_event_execute(queue, copy);
+            if (result != VK_SUCCESS)
+               break;
+            continue;
+         }
+         if (copy->bytes == 0)
+            continue;
+         if (copy->fill) {
+            /* A fill writes the same word over the range, four bytes at a time
+             * (valid usage aligns both ends). */
+            uint32_t *const words = (uint32_t *)(uintptr_t)copy->destination;
+            const uint64_t count = copy->bytes / 4;
+            for (uint64_t word = 0; word < count; word++)
+               words[word] = copy->fill_value;
+            ps5vk_flush_cpu_cache((const void *)(uintptr_t)copy->destination,
+                                  (size_t)copy->bytes);
+            continue;
+         }
+         ps5vk_flush_cpu_cache((const void *)(uintptr_t)copy->source, (size_t)copy->bytes);
+         if (copy->reverse_texel_bytes == 0) {
+            memcpy((void *)(uintptr_t)copy->destination, (const void *)(uintptr_t)copy->source,
+                   (size_t)copy->bytes);
+         } else {
+            /* An application's bytes meeting a reversed image's: the four bytes of
+             * every texel swap as they move (ps5vk_format.storage_reversed). */
+            const uint8_t *const from = (const uint8_t *)(uintptr_t)copy->source;
+            uint8_t *const to = (uint8_t *)(uintptr_t)copy->destination;
+            const uint32_t texel_bytes = copy->reverse_texel_bytes;
+            for (uint64_t texel = 0; texel + texel_bytes <= copy->bytes; texel += texel_bytes) {
+               for (uint32_t byte = 0; byte < texel_bytes; byte++)
+                  to[texel + byte] = from[texel + texel_bytes - 1u - byte];
+            }
+         }
+         ps5vk_flush_cpu_cache((const void *)(uintptr_t)copy->destination, (size_t)copy->bytes);
+      }
+      if (result != VK_SUCCESS)
+         break;
+      if (queue->profile.enabled)
+         queue->profile.copy_ns += ps5vk_profile_now() - copy_started;
+      start = end;
+   }
+   free(saved);
+   return result;
+}
+
+/* R69: where a submission's stream starts in the buffer. With nothing in
+ * flight that is the buffer's start, as it always was; otherwise the stream
+ * follows the one before it, on its own cache lines, since the GPU may still
+ * be reading the earlier ones, and a stream that no longer fits waits for the
+ * queue to drain and starts over. footprint is the most words the stream and
+ * its end packets can take. */
+static size_t
+ps5vk_queue_stream_base(struct ps5vk_queue *queue, size_t capacity, size_t footprint,
+                        VkResult *result)
+{
+   *result = VK_SUCCESS;
+   mtx_lock(&queue->lock);
+   const uint32_t submitted = queue->submitted_value;
+   mtx_unlock(&queue->lock);
+   if (ps5vk_marker_reached(ps5vk_queue_poll(queue), submitted))
+      return 0;
+   const size_t base = ALIGN_POT((size_t)queue->ring_head, 16);
+   if (base <= capacity && footprint <= capacity - base)
+      return base;
+   *result = ps5vk_queue_wait_idle(queue);
+   return 0;
+}
+
+/* Steps 2 to 4 for a submission with command buffers. */
+static VkResult
+ps5vk_queue_run(struct ps5vk_queue *queue, const struct vk_queue_submit *submit)
+{
+   uint32_t *const buffer = queue->submission.address;
+   const size_t buffer_capacity = queue->submission.bytes / sizeof(uint32_t) - 1 -
+                                  PS5VK_SWAPCHAIN_IMAGES * PS5VK_FLIP_SLOT_WORDS;
+   uint32_t *const marker = buffer + buffer_capacity;
+   /* Streams stop at R70's fence, which lies just below the marker. */
+   const size_t usable_capacity = (size_t)(queue->fence - buffer);
+   size_t footprint = ps5vk_queue_end_words(queue) + 2 * PS5VK_TIMESTAMP_EVENT_WORDS +
+                      PS5VK_SWAPCHAIN_IMAGES * sceAgcDriverGetWaitRenderingPacketSizeInDwords() +
+                      PS5VK_MARKER_WAIT_WORDS;
+   for (uint32_t i = 0; i < submit->command_buffer_count; i++) {
+      const struct ps5vk_cmd_buffer *const cmd_buffer =
+         container_of(submit->command_buffers[i], struct ps5vk_cmd_buffer, vk);
+      footprint += util_dynarray_num_elements(&cmd_buffer->words, uint32_t) + PS5VK_GPU_BARRIER_WORDS;
+   }
+   VkResult placed;
+   const size_t base = ps5vk_queue_stream_base(queue, usable_capacity, footprint, &placed);
+   if (placed != VK_SUCCESS)
+      return placed;
+   uint32_t *const stream = buffer + base;
+   const size_t capacity = usable_capacity - base;
+   size_t words = 0;
+
+   /* The steps this submission runs as, which the runner's capture reads whole
+    * (ps5vk_debug_last_submission). */
+   queue->step_count = 0;
+
+   /* A submission that renders into a swapchain image starts with the image's
+    * wait packet: the GPU waits until VideoOut no longer scans that buffer out
+    * (M2, C1). There is one VideoOut, so each buffer waits once. */
+   const size_t end_words = ps5vk_queue_end_words(queue);
+   /* While profiling, the first step starts with a timestamp and has another
+    * after the wait packets (ps5vk_queue_profile_stamps); both fit, as the
+    * buffer holds far more than two packets and the end words. */
+   uint64_t *const stamps = queue->stamps.address;
+   if (stamps != NULL) {
+      stamps[PS5VK_STAMP_START] = 0;
+      stamps[PS5VK_STAMP_WAITED] = 0;
+      ps5vk_flush_cpu_cache(stamps, 2 * sizeof(uint64_t));
+      ps5vk_timestamp_packet(stream + words, ps5vk_queue_stamp_address(queue, PS5VK_STAMP_START));
+      words += PS5VK_TIMESTAMP_EVENT_WORDS;
+   }
+   /* R70: the step before this submission may still be running (R69), and
+    * nothing in these words orders their reads after its writes: the GPU
+    * waits for its marker first. Its end packets flushed and invalidated the
+    * caches, so what it rendered is in memory once the marker is. */
+   mtx_lock(&queue->lock);
+   const uint32_t previous = queue->submitted_value;
+   mtx_unlock(&queue->lock);
+   if (previous != 0 && !ps5vk_marker_reached(ps5vk_queue_poll(queue), previous)) {
+      ps5vk_marker_wait_words(stream + words, (uint64_t)(uintptr_t)queue->marker, previous);
+      words += PS5VK_MARKER_WAIT_WORDS;
+      if (queue->profile.enabled)
+         queue->profile.step_waits++;
+   }
+   const uint32_t wait_words = sceAgcDriverGetWaitRenderingPacketSizeInDwords();
+   uint32_t waited = 0;
+   for (uint32_t i = 0; i < submit->command_buffer_count; i++) {
+      const struct ps5vk_cmd_buffer *const cmd_buffer =
+         container_of(submit->command_buffers[i], struct ps5vk_cmd_buffer, vk);
+      util_dynarray_foreach (&cmd_buffer->targets, struct ps5vk_render_target, target) {
+         if (target->video < 0 || (waited & (UINT32_C(1) << target->buffer_index)))
+            continue;
+         if (wait_words > capacity - end_words - words)
+            return vk_errorf(queue, VK_ERROR_OUT_OF_DEVICE_MEMORY,
+                             "no room for a wait packet in the submission buffer");
+         uint32_t *up = stream + words;
+         const uint32_t result = sceAgcDriverWaitUntilSafeForRendering(
+            &up, wait_words, 0, (uint32_t)target->video, (int)target->buffer_index);
+         if (result != 0 || up != stream + words + wait_words)
+            return vk_queue_set_lost(&queue->vk,
+                                     "the AGC helper did not write the wait packet of buffer %u: "
+                                     "0x%08x", target->buffer_index, (unsigned)result);
+         words += wait_words;
+         waited |= UINT32_C(1) << target->buffer_index;
+      }
+   }
+   if (stamps != NULL) {
+      ps5vk_timestamp_packet(stream + words, ps5vk_queue_stamp_address(queue, PS5VK_STAMP_WAITED));
+      words += PS5VK_TIMESTAMP_EVENT_WORDS;
+      queue->start_stamped = true;
+   }
+
+   /* The copies and synchronization splits the command buffers recorded, and
+    * the stream offset each of them falls at: the submission is split into
+    * steps there (Phase C2, C4). */
+   struct util_dynarray splits;
+   util_dynarray_init(&splits, NULL);
+   for (uint32_t i = 0; i < submit->command_buffer_count; i++) {
+      const struct ps5vk_cmd_buffer *const cmd_buffer =
+         container_of(submit->command_buffers[i], struct ps5vk_cmd_buffer, vk);
+      const size_t count = util_dynarray_num_elements(&cmd_buffer->words, uint32_t);
+      if (count > capacity - end_words - words) {
+         util_dynarray_fini(&splits);
+         return vk_errorf(queue, VK_ERROR_OUT_OF_DEVICE_MEMORY,
+                          "a submission of more than %zu words", capacity - end_words);
+      }
+      /* A copy or split falls after the words its command buffer had recorded
+       * when the application recorded it, which is that command buffer's
+       * words' start in the stream plus that offset. */
+      util_dynarray_foreach (&cmd_buffer->copies, struct ps5vk_memory_copy, copy) {
+         struct ps5vk_copy_split *const split =
+            util_dynarray_grow(&splits, struct ps5vk_copy_split, 1);
+         if (!split) {
+            util_dynarray_fini(&splits);
+            return vk_errorf(queue, VK_ERROR_OUT_OF_HOST_MEMORY,
+                             "no memory to track the copies of a submission");
+         }
+         *split = (struct ps5vk_copy_split){
+            .offset = (uint32_t)words + MIN2(copy->after_words, (uint32_t)count),
+            .copy = copy,
+         };
+      }
+      if (count != 0)
+         memcpy(stream + words, util_dynarray_begin(&cmd_buffer->words), count * sizeof(uint32_t));
+      /* R70: each GPU barrier the command buffer recorded gets its fence value
+       * now, one the fence has never held. */
+      util_dynarray_foreach (&cmd_buffer->fence_patches, uint32_t, patch) {
+         queue->fence_value = queue->fence_value == UINT32_MAX ? 1 : queue->fence_value + 1;
+         stream[words + *patch + PS5VK_GPU_BARRIER_VALUE_WORD] = queue->fence_value;
+         stream[words + *patch + PS5VK_GPU_BARRIER_REF_WORD] = queue->fence_value;
+         if (queue->profile.enabled)
+            queue->profile.gpu_barriers++;
+      }
+      words += count;
+      /* The next command buffer's reads follow this one's renders only through
+       * a GPU barrier between them: the words run as one stream. It is needed
+       * where this one rendered and the next samples before a barrier of its
+       * own. */
+      const struct ps5vk_cmd_buffer *const next =
+         i + 1 < submit->command_buffer_count
+            ? container_of(submit->command_buffers[i + 1], struct ps5vk_cmd_buffer, vk)
+            : NULL;
+      if (next != NULL && next->samples_early &&
+          util_dynarray_num_elements(&cmd_buffer->targets, struct ps5vk_render_target) != 0 &&
+          queue->fence != NULL) {
+         queue->fence_value = queue->fence_value == UINT32_MAX ? 1 : queue->fence_value + 1;
+         ps5vk_gpu_barrier_words(stream + words, (uint64_t)(uintptr_t)queue->fence,
+                                 queue->fence_value);
+         words += PS5VK_GPU_BARRIER_WORDS;
+         if (queue->profile.enabled)
+            queue->profile.gpu_barriers++;
+      }
+   }
+
+   /* The next submission starts past these words and their end packets. */
+   queue->ring_head = (uint32_t)(base + words + end_words);
+   VkResult result;
+   if (util_dynarray_num_elements(&splits, struct ps5vk_copy_split) == 0) {
+      /* Without copies or splits the submission is one step of every word,
+       * ended by the barrier and the marker, as every frame recorded so far
+       * has been. */
+      result = ps5vk_queue_run_step(queue, submit, stream, capacity, marker, 0, (uint32_t)words,
+                                    NULL, false);
+   } else {
+      result = ps5vk_queue_run_copy_steps(queue, submit, stream, capacity, marker, (uint32_t)words,
+                                          &splits);
+   }
+   util_dynarray_fini(&splits);
+   return result;
+}
+
+static VkResult
+ps5vk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
+{
+   struct ps5vk_queue *const queue = container_of(vk_queue, struct ps5vk_queue, vk);
+   struct vk_device *const device = vk_queue->base.device;
+
+   const uint64_t started = queue->profile.enabled ? ps5vk_profile_now() : 0;
+   ps5vk_profile_enter(queue, PS5VK_PROFILE_AFTER_SUBMIT);
+   if (queue->profile.enabled) {
+      struct ps5vk_queue_profile *const p = &queue->profile;
+      /* The stretch of the frame the application owns: from the moment the
+       * previous present handed control back to this submission. */
+      if (p->last_return_ns != 0 && started > p->last_return_ns)
+         p->app_pre_submit_ns += started - p->last_return_ns;
+      p->submit_calls++;
+   }
+   /* A semaphore an earlier submission to this queue signalled needs no CPU
+    * wait: the GPU runs this queue's submissions in order (R69). */
+   VkResult result = VK_SUCCESS;
+   for (uint32_t i = 0; i < submit->wait_count && result == VK_SUCCESS; i++) {
+      if (!ps5vk_sync_pending_on(submit->waits[i].sync, queue))
+         result = vk_sync_wait(device, submit->waits[i].sync, submit->waits[i].wait_value,
+                               VK_SYNC_WAIT_COMPLETE, UINT64_MAX);
+   }
+   if (queue->profile.enabled)
+      queue->profile.sync_wait_ns += ps5vk_profile_now() - started;
+   if (result != VK_SUCCESS)
+      return result;
+   if (submit->command_buffer_count != 0) {
+      result = ps5vk_queue_run(queue, submit);
+      if (result != VK_SUCCESS)
+         return result;
+   }
+   const uint64_t signal_started = queue->profile.enabled ? ps5vk_profile_now() : 0;
+   /* The signals hold once the GPU reaches the last step submitted -- this
+    * submission's, or for one without command buffers the one before it. */
+   mtx_lock(&queue->lock);
+   const uint32_t submitted = queue->submitted_value;
+   mtx_unlock(&queue->lock);
+   const bool pending = !ps5vk_marker_reached(ps5vk_queue_poll(queue), submitted);
+   for (uint32_t i = 0; i < submit->signal_count && result == VK_SUCCESS; i++) {
+      struct vk_sync *const sync = submit->signals[i].sync;
+      if (pending && sync->type == &ps5vk_sync_type)
+         ps5vk_sync_signal_pending(sync, queue, submitted);
+      else
+         result = vk_sync_signal(device, sync, submit->signals[i].signal_value);
+   }
+   if (queue->profile.enabled) {
+      const uint64_t finished = ps5vk_profile_now();
+      queue->profile.sync_signal_ns += finished - signal_started;
+      queue->profile.queue_ns += finished - started;
+      queue->profile.last_return_ns = finished;
+   }
+   ps5vk_profile_leave(queue, PS5VK_PROFILE_AFTER_SUBMIT);
+   return result;
+}
+
+/* The flip mode the runner flips with. */
+#define PS5VK_FLIP_MODE 1
+
+/* The second summary line: what the first one cannot show. A mean frame time
+ * hides whether the period is the work or the refresh, whether a "gpu" interval
+ * is execution or check granularity, and whether a present waited a vblank at
+ * all. Each mean is over the count its own label names, never over a total.
+ * The period histogram prints only the buckets that hold a sample, as
+ * bucket:count, with the bucket number its 4 ms lower bound.
+ *
+ * residual_ms is the check that the split is complete: the four parts summed
+ * per present against the measured present-to-present period. Anything but
+ * about zero means the frame spends time somewhere this profile does not name,
+ * and the attribution below it is not to be trusted.
+ *
+ * The whole line is formatted into one buffer and written once. That is not a
+ * style choice: the port this driver serves reopens stderr unbuffered onto a
+ * file inside the title's folder (vQuake's src/trace.cpp), so every stdio write
+ * is a separate syscall on the mounted filesystem, and a summary emitted as one
+ * fprintf per field measured twelve per cent of the frame budget on the
+ * console. R31's first version did exactly that and slowed the game it was
+ * measuring; the fix is one write, and the rule is that this line and the one
+ * above it may never grow into a loop. */
+static void
+ps5vk_queue_profile_report2(struct ps5vk_queue_profile *p, uint64_t now, char *line,
+                            size_t line_bytes)
+{
+   /* The caller already formatted the first line into this buffer; the second
+    * is appended to it so that both leave as one write. */
+   const size_t used = strlen(line);
+   const double per_present = p->frames != 0 ? 1.0 / ((double)p->frames * 1000000.0) : 0.0;
+   const double per_step = p->steps != 0 ? 1.0 / ((double)p->steps * 1000000.0) : 0.0;
+   const double frame_ms = p->present_gap_count != 0
+                              ? (double)p->present_gap_ns / ((double)p->present_gap_count * 1000000.0)
+                              : 0.0;
+   const double summed_ms = (double)(p->app_pre_submit_ns + p->queue_ns + p->app_pre_present_ns +
+                                     p->flip_ns) *
+                            per_present;
+   /* Everything the chain accounted for, against the application time the
+    * present boundaries measured: named_ms that differs from
+    * app_pre + app_post means a stretch is missing from the chain. */
+   uint64_t named_ns = 0;
+   for (unsigned slot = 0; slot < PS5VK_PROFILE_SLOTS; slot++)
+      named_ns += p->gap_ns[slot] + p->call_ns[slot];
+   const double named_ms = (double)named_ns * per_present;
+   const double unnamed_ms =
+      (p->app_pre_submit_ns + p->app_pre_present_ns) * per_present - named_ms;
+   char periods[256];
+   size_t at = 0;
+   for (unsigned bucket = 0; bucket < PS5VK_PERIOD_BUCKETS; bucket++) {
+      /* A bucket name is at most "64:4294967295 ", so sixteen bytes of room is
+       * always enough and the buffer can never be overrun by the append. */
+      if (p->present_period[bucket] == 0)
+         continue;
+      if (sizeof(periods) - at < 16)
+         break;
+      at += (size_t)snprintf(periods + at, sizeof(periods) - at, "%u:%u ", bucket * 4u,
+                             p->present_period[bucket]);
+   }
+   periods[at] = '\0';
+   snprintf(line + used, line_bytes - used,
+            "[ps5vk] profile2 app_pre_ms=%.3f app_post_ms=%.3f app_after_present_ms=%.3f "
+            "app_after_acquire_ms=%.3f app_after_submit_ms=%.3f app_after_query_ms=%.3f "
+            "app_after_begin_ms=%.3f app_after_end_ms=%.3f submit_ms=%.3f "
+            "submit_calls/frame=%.2f poll_ms=%.3f polls/step=%.2f poll_first=%.0f%% "
+            "flip_status/present=%.2f flip_status_ms=%.3f vblank/present=%.2f "
+            "vblank_ms=%.3f vblank_first=%.0f%% frame_ms=%.3f frame_min_ms=%.3f "
+            "frame_max_ms=%.3f residual_ms=%.3f call_acquire_ms=%.3f call_query_ms=%.3f "
+            "call_begin_ms=%.3f call_end_ms=%.3f named_ms=%.3f unnamed_ms=%.3f "
+            "draws/frame=%.1f begins/frame=%.1f call_draw_ms=%.3f between_draws_ms=%.3f "
+            "secondary_begins/frame=%.1f call_begin_secondary_ms=%.3f resets/frame=%.1f "
+            "reset_common_ms=%.3f reset_driver_ms=%.3f last_write_ms=%.3f clock_ns=%.1f hitches=%" PRIu64 " "
+            "executes/frame=%.1f executed/frame=%.1f call_execute_ms=%.3f "
+            "presents=%" PRIu64 "/%" PRIu64
+            " periods=%s elapsed_ms=%.0f\n",
+            p->app_pre_submit_ns * per_present, p->app_pre_present_ns * per_present,
+            p->gap_ns[PS5VK_PROFILE_AFTER_PRESENT] * per_present,
+            p->gap_ns[PS5VK_PROFILE_AFTER_ACQUIRE] * per_present,
+            p->gap_ns[PS5VK_PROFILE_AFTER_SUBMIT] * per_present,
+            p->gap_ns[PS5VK_PROFILE_AFTER_QUERY] * per_present,
+            p->gap_ns[PS5VK_PROFILE_AFTER_BEGIN] * per_present,
+            p->gap_ns[PS5VK_PROFILE_AFTER_END] * per_present, p->submit_call_ns * per_step,
+            p->frames != 0 ? (double)p->submit_calls / (double)p->frames : 0.0,
+            p->poll_ns * per_step, p->steps != 0 ? (double)p->polls / (double)p->steps : 0.0,
+            p->steps != 0 ? 100.0 * (double)p->poll_first_hits / (double)p->steps : 0.0,
+            p->frames != 0 ? (double)p->flip_status_calls / (double)p->frames : 0.0,
+            p->flip_status_ns * per_present,
+            p->frames != 0 ? (double)p->flip_vblank_waits / (double)p->frames : 0.0,
+            p->flip_vblank_ns * per_present,
+            p->frames != 0 ? 100.0 * (double)p->flip_first_hits / (double)p->frames : 0.0,
+            frame_ms, (double)p->present_gap_min_ns / 1000000.0,
+            (double)p->present_gap_max_ns / 1000000.0, summed_ms - frame_ms,
+            p->call_ns[PS5VK_PROFILE_AFTER_ACQUIRE] * per_present,
+            p->call_ns[PS5VK_PROFILE_AFTER_QUERY] * per_present,
+            p->call_ns[PS5VK_PROFILE_AFTER_BEGIN] * per_present,
+            p->call_ns[PS5VK_PROFILE_AFTER_END] * per_present, named_ms, unnamed_ms,
+            p->frames != 0 ? (double)p->gap_count[PS5VK_PROFILE_AFTER_DRAW] / (double)p->frames : 0.0,
+            p->frames != 0 ? (double)p->gap_count[PS5VK_PROFILE_AFTER_BEGIN] / (double)p->frames : 0.0,
+            p->call_ns[PS5VK_PROFILE_AFTER_DRAW] * per_present,
+            p->gap_ns[PS5VK_PROFILE_AFTER_DRAW] * per_present,
+            p->frames != 0 ? (double)p->begin_secondary_calls / (double)p->frames : 0.0,
+            p->begin_secondary_ns * per_present,
+            p->frames != 0 ? (double)p->resets / (double)p->frames : 0.0,
+            p->reset_common_ns * per_present, p->reset_driver_ns * per_present,
+            (double)p->report_write_ns / 1000000.0, (double)p->clock_ns_x1000 / 1000.0,
+            p->hitches,
+            p->frames != 0 ? (double)p->execute_calls / (double)p->frames : 0.0,
+            p->frames != 0 ? (double)p->execute_buffers / (double)p->frames : 0.0,
+            p->execute_ns * per_present,
+            p->present_index[0], p->present_index[1], periods,
+            (double)(now - p->since) / 1000000.0);
+   /* One write(2), not fputs: the port reopens stderr unbuffered, and the
+    * console's libc then hands an unbuffered fputs to the file in pieces -- R34
+    * measured this one line at 1.6-5.8 s, interleaved with other threads' lines,
+    * while the port's own fully buffered line to the same file cost nothing. */
+   const uint64_t written = ps5vk_profile_now();
+   /* The stream's own descriptor: the port reopens stderr onto its trace file,
+    * and on the console that stream does not keep descriptor 2 -- a first
+    * version wrote to STDERR_FILENO and its lines reached neither the trace nor
+    * the kernel log. */
+   fflush(stderr);
+   const int descriptor = fileno(stderr);
+   const size_t length = strlen(line);
+   for (size_t at = 0; descriptor >= 0 && at < length;) {
+      const ssize_t wrote = write(descriptor, line + at, length - at);
+      if (wrote <= 0)
+         break;
+      at += (size_t)wrote;
+   }
+   p->report_write_ns = ps5vk_profile_now() - written;
+}
+
+/* A total over a count, in milliseconds each; zero for no count. */
+static double
+ps5vk_per_ms(uint64_t ns, uint64_t count)
+{
+   return count != 0 ? (double)ns / ((double)count * 1000000.0) : 0.0;
+}
+
+/* A flip counted as presented: the frame count, its period since the previous
+ * one and, every ten seconds, the profile's summary lines. started is when the
+ * present began; first_hit whether VideoOut had shown it at the first look. */
+static void
+ps5vk_queue_flip_presented(struct ps5vk_queue *queue, uint64_t started, bool first_hit)
+{
+   struct ps5vk_queue_profile *const p = &queue->profile;
+   if (p->enabled) {
+      const uint64_t now = ps5vk_profile_now();
+      p->frames++;
+      p->flip_ns += now - started;
+      p->flip_first_hits += first_hit;
+      /* The period of a presented frame, measured between two confirmed
+       * presents rather than derived from a throttled count. */
+      if (p->last_present_ns != 0 && now > p->last_present_ns) {
+         const uint64_t gap = now - p->last_present_ns;
+         const unsigned bucket = gap / UINT64_C(4000000);
+         p->present_gap_ns += gap;
+         p->present_gap_count++;
+         if (p->present_gap_min_ns == 0 || gap < p->present_gap_min_ns)
+            p->present_gap_min_ns = gap;
+         if (gap > p->present_gap_max_ns)
+            p->present_gap_max_ns = gap;
+         ps5vk_hitch_frame(p, gap);
+         p->present_period[bucket < PS5VK_PERIOD_BUCKETS ? bucket
+                                                         : PS5VK_PERIOD_BUCKETS - 1]++;
+      }
+      p->last_present_ns = now;
+      if (p->since == 0 || now - p->since >= UINT64_C(10000000000)) {
+         if (p->since != 0) {
+            const double ms = 1.0 / ((double)p->frames * 1000000.0);
+            /* Both summary lines go out as one write: see the note on
+             * ps5vk_queue_profile_report2 for what a second one costs. */
+            char line[3072];
+            char copies[320];
+            char kinds[160];
+            uint64_t live_count = 0, live_bytes = 0;
+            ps5vk_direct_memory_live(&live_count, &live_bytes);
+            snprintf(line, sizeof(line),
+                    "[ps5vk] profile frames=%" PRIu64 " steps/frame=%.2f "
+                    "queue_ms=%.3f flush_ms=%.3f gpu_ms=%.3f flip_ms=%.3f "
+                    "flush_MiB/frame=%.2f copy_ms=%.3f sync_wait_ms=%.3f sync_signal_ms=%.3f "
+                    "stamped=%" PRIu64 "/%" PRIu64 " display_wait_ms=%.3f gpu_work_ms=%.3f "
+                    "late_ms=%.3f wait_max_ms=%.3f work_max_ms=%.3f late_max_ms=%.3f "
+                    "later_steps=%" PRIu64 " later_step_ms=%.3f suspend_mode=%u rescues=%" PRIu64
+                    " flag_refusals=%" PRIu64 " async_steps=%" PRIu64 " pending_waits=%" PRIu64
+                    " pending_wait_ms=%.3f gpu_barriers=%" PRIu64 " step_waits=%" PRIu64
+                    " cpu_copies=%s direct_live=%" PRIu64 "/%" PRIu64 "MiB direct_kinds=%s\n",
+                    p->frames,
+                    (double)p->steps / p->frames, p->queue_ns * ms, p->flush_ns * ms,
+                    p->gpu_ns * ms, p->flip_ns * ms,
+                    (double)p->flush_bytes / (p->frames * 1048576.0),
+                    p->copy_ns * ms, p->sync_wait_ns * ms, p->sync_signal_ns * ms,
+                    p->stamp_steps, p->stamp_steps + p->stamp_missing,
+                    ps5vk_per_ms(p->stamp_wait_ns, p->stamp_steps),
+                    ps5vk_per_ms(p->stamp_work_ns, p->stamp_steps),
+                    ps5vk_per_ms(p->stamp_late_ns, p->stamp_steps),
+                    p->stamp_wait_max_ns / 1000000.0, p->stamp_work_max_ns / 1000000.0,
+                    p->stamp_late_max_ns / 1000000.0, p->later_steps,
+                    ps5vk_per_ms(p->later_step_ns, p->later_steps), p->suspend_mode, p->rescues,
+                    p->flag_refusals, p->async_steps, p->pending_waits,
+                    p->pending_wait_ns * ms, p->gpu_barriers, p->step_waits,
+                    ps5vk_profile_cpu_copies(p, copies, sizeof(copies)), live_count,
+                    live_bytes >> 20, ps5vk_direct_memory_kinds(kinds, sizeof(kinds)));
+            ps5vk_queue_profile_report2(p, now, line, sizeof(line));
+         }
+         /* last_return_ns and last_present_ns carry across a window: the
+          * first interval after one is still a real one. */
+         /* The hitch counters are process-wide and cumulative, so their
+          * snapshot outlives the window. */
+         uint64_t hitch_calls[PS5VK_HITCH_KINDS], hitch_ns[PS5VK_HITCH_KINDS];
+         memcpy(hitch_calls, p->frame_hitch_calls, sizeof(hitch_calls));
+         memcpy(hitch_ns, p->frame_hitch_ns, sizeof(hitch_ns));
+         if (p->since != 0)
+            queue->profile_windows++;
+         const unsigned suspend_mode = (ps5vk_ab_flags & PS5VK_AB_SUBMIT_CYCLE)
+                                          ? queue->profile_windows % PS5VK_SUSPEND_MODES
+                                          : 0;
+         *p = (struct ps5vk_queue_profile){.enabled = true,
+                                           .suspend_mode = suspend_mode,
+                                           .since = now,
+                                           .last_return_ns = now,
+                                           .last_present_ns = now,
+                                           .report_write_ns = p->report_write_ns,
+                                           .clock_ns_x1000 = p->clock_ns_x1000};
+         memcpy(p->frame_hitch_calls, hitch_calls, sizeof(hitch_calls));
+         memcpy(p->frame_hitch_ns, hitch_ns, sizeof(hitch_ns));
+      }
+   }
+}
+
+/* A flip in a stream of its own, as run pid 134 presented (c1-present):
+ * submitted, through the suspend point, then -- when wait_shown -- confirmed
+ * when VideoOut's flip status reaches marker, waiting a vblank at a time as
+ * the runner waits. */
+VkResult
+ps5vk_queue_flip(struct ps5vk_queue *queue, int video, uint32_t buffer_index, int64_t marker,
+                 bool wait_shown)
+{
+   struct ps5vk_queue_profile *const p = &queue->profile;
+   const uint64_t started = p->enabled ? ps5vk_profile_now() : 0;
+   if (p->enabled) {
+      /* The rest of the frame the application owns: from the submission's
+       * return to this present. */
+      if (p->last_return_ns != 0 && started > p->last_return_ns)
+         p->app_pre_present_ns += started - p->last_return_ns;
+      if (buffer_index < 2)
+         p->present_index[buffer_index]++;
+   }
+   /* The image's own slot (PS5VK_FLIP_SLOT_WORDS). */
+   uint32_t *const stream = (uint32_t *)queue->submission.address +
+                            queue->submission.bytes / sizeof(uint32_t) -
+                            (size_t)(PS5VK_SWAPCHAIN_IMAGES - buffer_index) * PS5VK_FLIP_SLOT_WORDS;
+   const size_t capacity = PS5VK_FLIP_SLOT_WORDS - 1;
+   struct ps5vk_agc_command_buffer command = {
+      .bottom = stream,
+      .top = stream + capacity,
+      .up = stream,
+      .down = stream + capacity,
+      .callback = (uintptr_t)ps5vk_agc_out_of_space,
+   };
+   if (!sceAgcDcbSetFlip(&command, (uint32_t)video, (int)buffer_index, PS5VK_FLIP_MODE, marker) ||
+       command.up > command.top)
+      return vk_queue_set_lost(&queue->vk, "the AGC helper did not write the flip of buffer %u",
+                               buffer_index);
+   const uint32_t word_count = (uint32_t)(command.up - command.bottom);
+   /* A flip is a stream of its own in the same buffer: the capture reads this
+    * count with the words (ps5vk_debug_last_submission) -- and it is the
+    * submission the step list has to report, or a capture of a flip logs the
+    * previous draw's step: the draw's length over the flip's words, which is
+    * 104 words over 64 for c1-triangle and 40 words of the draw's own buffer
+    * behind them (2026-09-20). */
+   queue->last_words = word_count;
+   queue->last_stream = stream;
+   queue->step_count = 1;
+   queue->steps[0].stream = stream;
+   queue->steps[0].words = word_count;
+   ps5vk_flush_cpu_cache(stream, word_count * sizeof(uint32_t));
+
+   struct ps5vk_agc_submit_description description = {
+      .words = stream,
+      .word_count = word_count,
+   };
+   int32_t result = sceAgcDriverSubmitDcb(&description);
+   if (result != 0)
+      return vk_queue_set_lost(&queue->vk, "sceAgcDriverSubmitDcb failed for a flip: 0x%08x",
+                               (unsigned)result);
+   /* A flip whose shown status is waited for always passes one: that wait
+    * has no rescue of its own. */
+   if (wait_shown || ps5vk_queue_suspends(queue, true)) {
+      result = sceAgcSuspendPoint();
+      if (result != 0)
+         return vk_queue_set_lost(&queue->vk, "sceAgcSuspendPoint failed after a flip: 0x%08x",
+                                  (unsigned)result);
+   }
+   /* A FIFO present returns once the flip is queued: VideoOut shows it at a
+    * later vblank while the application goes on to its next frame, and the
+    * acquire of an image still on screen or queued is what waits
+    * (ps5vk_wsi.c). */
+   if (!wait_shown) {
+      ps5vk_queue_flip_presented(queue, started, true);
+      return VK_SUCCESS;
+   }
+
+   uint64_t status[PS5VK_FLIP_STATUS_WORDS];
+   for (unsigned wait = 0; wait < PS5VK_FLIP_WAITS; wait++) {
+      const uint64_t queried = p->enabled ? ps5vk_profile_now() : 0;
+      const int32_t flipped = sceVideoOutGetFlipStatus(video, status);
+      if (p->enabled) {
+         p->flip_status_calls++;
+         p->flip_status_ns += ps5vk_profile_now() - queried;
+      }
+      if (flipped == 0 && (int64_t)status[PS5VK_FLIP_STATUS_MARKER] >= marker) {
+         ps5vk_queue_flip_presented(queue, started, wait == 0);
+         return VK_SUCCESS;
+      }
+      const uint64_t waited = p->enabled ? ps5vk_profile_now() : 0;
+      sceVideoOutWaitVblank(video);
+      if (p->enabled) {
+         p->flip_vblank_waits++;
+         p->flip_vblank_ns += ps5vk_profile_now() - waited;
+      }
+   }
+   return vk_queue_set_lost(&queue->vk,
+                            "flip %" PRId64 " of buffer %u did not reach VideoOut within %d "
+                            "vblanks", marker, buffer_index, PS5VK_FLIP_WAITS);
+}
+
+static uint64_t
+ps5vk_copy_side_run_bytes(const struct ps5vk_image_copy_side *side, uint32_t texel_bytes);
+
+/* An upload into tiled storage (C7): the source is linear, the destination a
+ * tiled side, so the region's texels are read row by row from the source's pitch
+ * and written at the place the image's own map gives them.
+ *
+ * R95: a run at a time, not a texel. The map keeps the bytes of a run
+ * contiguous (ps5vk_copy_side_run_bytes: sixteen for a colour map, eight for
+ * the one-byte map, two texels of a depth map), so the texels of a run aligned
+ * to its size share one address and one copy. Dolphin uploads a full-screen
+ * texture every frame in Rogue Leader (1.1 MiB, sixty a second), and the
+ * address of every texel was the largest single cost on its GPU thread. A side
+ * whose level offset flips the bits inside a run keeps a texel at a time. */
+void
+ps5vk_image_write_execute(const struct ps5vk_memory_copy *copy)
+{
+   const uint8_t *const source = (const uint8_t *)(uintptr_t)copy->source;
+   const uint32_t texel_bytes = copy->destination_texel_bytes;
+   ps5vk_flush_cpu_cache(source, (size_t)(copy->source_pitch * (copy->height - 1u) +
+                                          (uint64_t)copy->width * texel_bytes));
+   const uint64_t run_limit = ps5vk_copy_side_run_bytes(&copy->destination_side, texel_bytes);
+   uint32_t run_texels = 1;
+   if (run_limit != UINT64_MAX && run_limit >= texel_bytes &&
+       ((uint64_t)copy->destination_side.tile_xor & (run_limit - 1u)) == 0)
+      run_texels = (uint32_t)(run_limit / texel_bytes);
+   uint64_t low = UINT64_MAX, high = 0;
+   for (uint32_t row = 0; row < copy->height; row++) {
+      const uint8_t *const row_source = source + (uint64_t)row * copy->source_pitch;
+      uint32_t x = 0;
+      while (x < copy->width) {
+         const uint32_t column = copy->destination_x + x;
+         const uint32_t count = MIN2(run_texels - column % run_texels, copy->width - x);
+         const uint32_t bytes = count * texel_bytes;
+         uint8_t *const destination = (uint8_t *)(uintptr_t)ps5vk_image_copy_address(
+            &copy->destination_side, (int32_t)column, (int32_t)(copy->destination_y + row),
+            texel_bytes, 0);
+         low = MIN2(low, (uint64_t)(uintptr_t)destination);
+         high = MAX2(high, (uint64_t)(uintptr_t)destination + bytes);
+         const uint8_t *const texels = row_source + (uint64_t)x * texel_bytes;
+         if (copy->reverse_texel_bytes == 0) {
+            memcpy(destination, texels, bytes);
+         } else {
+            for (uint32_t at = 0; at < bytes; at += texel_bytes)
+               for (uint32_t byte = 0; byte < texel_bytes; byte++)
+                  destination[at + byte] = texels[at + texel_bytes - 1u - byte];
+         }
+         x += count;
+      }
+   }
+   /* The sampler reads these texels once the words after the split have run. */
+   if (low < high)
+      ps5vk_flush_cpu_cache((const void *)(uintptr_t)low, (size_t)(high - low));
+}
+
+/* The inverse of ps5vk_texel_to_rgba8 for the formats the driver can write a
+ * blit *into*: the eight-bit UNORM the resampler produced, encoded as the
+ * destination format's texel. Zero means no encode, which the recorded blit
+ * refuses by name (ps5vk_image.c); the packed float forms and the two depth
+ * formats are that case. The scaling rules are the decode's own read backwards,
+ * so a round trip through the two functions returns the byte the frame held. */
+static uint32_t
+ps5vk_scale8(uint8_t value, uint32_t max)
+{
+   /* 64 bits wide: a 32-bit channel's maximum overflows a 32-bit product, and
+    * the wrap made every 32-bit integer encode zero (round 5's host run,
+    * docs/M5_PHASE_C.md). */
+   return (uint32_t)(((uint64_t)value * max + 127u) / 255u);
+}
+
+/* IEEE binary16, round to nearest even: the decode's ps5vk_half_to_float read
+ * backwards for the values a blit carries. */
+static uint16_t
+ps5vk_float_to_half(float value)
+{
+   uint32_t bits = 0;
+   memcpy(&bits, &value, sizeof(bits));
+   const uint32_t sign = (bits >> 16) & 0x8000u;
+   const int32_t exponent = (int32_t)((bits >> 23) & 0xffu) - 127 + 15;
+   uint32_t mantissa = bits & 0x7fffffu;
+   if (((bits >> 23) & 0xffu) == 0xffu)
+      return (uint16_t)(sign | 0x7c00u | (mantissa != 0 ? 0x200u : 0u));
+   if (exponent >= 0x1f)
+      return (uint16_t)(sign | 0x7c00u);
+   if (exponent <= 0) {
+      if (exponent < -10)
+         return (uint16_t)sign;
+      mantissa |= 0x800000u;
+      const uint32_t shift = (uint32_t)(14 - exponent);
+      const uint32_t half = mantissa >> shift;
+      const uint32_t round = (mantissa >> (shift - 1u)) & 1u;
+      return (uint16_t)(sign | ((half + round) >> 1));
+   }
+   const uint32_t half = (uint32_t)exponent << 10 | (mantissa >> 13);
+   const uint32_t round = (mantissa >> 12) & 1u;
+   return (uint16_t)(sign | (half + round));
+}
+
+/* channels components of bits bits, little endian, red first: the integer and
+ * normalised families' encode, which is ps5vk_integer_to_rgba8 read backwards.
+ * Returns the bytes it wrote into texel. */
+static uint32_t
+ps5vk_rgba8_from_integer(const uint8_t rgba[4], unsigned bits, unsigned channels, bool is_signed,
+                         uint8_t texel[16])
+{
+   const unsigned bytes = bits / 8u;
+   memset(texel, 0, 16);
+   for (unsigned channel = 0; channel < channels; channel++) {
+      uint32_t value = 0;
+      if (is_signed)
+         value = (uint32_t)(int32_t)ps5vk_scale8(rgba[channel], (1u << (bits - 1u)) - 1u);
+      else
+         value = ps5vk_scale8(rgba[channel], bits == 32 ? UINT32_MAX : (1u << bits) - 1u);
+      memcpy(texel + channel * bytes, &value, bytes);
+   }
+   return channels * bytes;
+}
+
+uint32_t
+ps5vk_rgba8_to_texel(VkFormat format, const uint8_t rgba[4], uint8_t texel[16])
+{
+   memset(texel, 0, 16);
+   switch (format) {
+   case VK_FORMAT_R8G8B8A8_UNORM:
+      memcpy(texel, rgba, 4);
+      return 4;
+   case VK_FORMAT_A8B8G8R8_UNORM_PACK32:
+      texel[0] = rgba[3];
+      texel[1] = rgba[2];
+      texel[2] = rgba[1];
+      texel[3] = rgba[0];
+      return 4;
+   case VK_FORMAT_B8G8R8A8_UNORM:
+      texel[0] = rgba[2];
+      texel[1] = rgba[1];
+      texel[2] = rgba[0];
+      texel[3] = rgba[3];
+      return 4;
+   case VK_FORMAT_R8G8B8A8_SRGB:
+   case VK_FORMAT_A8B8G8R8_SRGB_PACK32:
+   case VK_FORMAT_B8G8R8A8_SRGB: {
+      /* The byte-reversed B8G8R8A8 form writes the three encoded channels in
+       * B, G, R order; the packed A8B8G8R8 one writes its storage's own
+       * R, G, B, A order (ps5vk_format.storage_reversed). */
+      const bool blue_first = format == VK_FORMAT_B8G8R8A8_SRGB;
+      for (unsigned channel = 0; channel < 3; channel++) {
+         const float linear = (float)rgba[channel] / 255.0f;
+         const float encoded = linear <= 0.0031308f
+                                  ? linear * 12.92f
+                                  : 1.055f * powf(linear, 1.0f / 2.4f) - 0.055f;
+         texel[blue_first ? 2u - channel : channel] =
+            (uint8_t)CLAMP((int32_t)floorf(encoded * 255.0f + 0.5f), 0, 255);
+      }
+      texel[3] = rgba[3];
+      return 4;
+   }
+   case VK_FORMAT_R8_UNORM:
+      texel[0] = rgba[0];
+      return 1;
+   case VK_FORMAT_R8G8_UNORM:
+      texel[0] = rgba[0];
+      texel[1] = rgba[1];
+      return 2;
+   case VK_FORMAT_R16_UNORM:
+   case VK_FORMAT_R16G16_UNORM:
+   case VK_FORMAT_R16G16B16A16_UNORM: {
+      const unsigned channels = format == VK_FORMAT_R16_UNORM ? 1u
+                               : format == VK_FORMAT_R16G16_UNORM ? 2u
+                                                                  : 4u;
+      return ps5vk_rgba8_from_integer(rgba, 16, channels, false, texel);
+   }
+   case VK_FORMAT_R16_SFLOAT:
+   case VK_FORMAT_R16G16_SFLOAT:
+   case VK_FORMAT_R16G16B16A16_SFLOAT: {
+      const unsigned channels = format == VK_FORMAT_R16_SFLOAT ? 1u
+                               : format == VK_FORMAT_R16G16_SFLOAT ? 2u
+                                                                   : 4u;
+      for (unsigned channel = 0; channel < channels; channel++) {
+         const uint16_t half = ps5vk_float_to_half((float)rgba[channel] / 255.0f);
+         memcpy(texel + channel * 2u, &half, sizeof(half));
+      }
+      return channels * 2u;
+   }
+   case VK_FORMAT_R32_SFLOAT:
+   case VK_FORMAT_R32G32_SFLOAT:
+   case VK_FORMAT_R32G32B32A32_SFLOAT: {
+      const unsigned channels = format == VK_FORMAT_R32_SFLOAT ? 1u
+                               : format == VK_FORMAT_R32G32_SFLOAT ? 2u
+                                                                   : 4u;
+      for (unsigned channel = 0; channel < channels; channel++) {
+         const float value = (float)rgba[channel] / 255.0f;
+         memcpy(texel + channel * 4u, &value, sizeof(value));
+      }
+      return channels * 4u;
+   }
+   case VK_FORMAT_R5G6B5_UNORM_PACK16: {
+      const uint32_t word = ps5vk_scale8(rgba[0], 31u) << 11 | ps5vk_scale8(rgba[1], 63u) << 5 |
+                            ps5vk_scale8(rgba[2], 31u);
+      memcpy(texel, &word, 2);
+      return 2;
+   }
+   case VK_FORMAT_A1R5G5B5_UNORM_PACK16: {
+      const uint32_t word = (rgba[3] >= 128 ? 1u : 0u) << 15 | ps5vk_scale8(rgba[0], 31u) << 10 |
+                            ps5vk_scale8(rgba[1], 31u) << 5 | ps5vk_scale8(rgba[2], 31u);
+      memcpy(texel, &word, 2);
+      return 2;
+   }
+   case VK_FORMAT_B4G4R4A4_UNORM_PACK16: {
+      const uint32_t word = ps5vk_scale8(rgba[3], 15u) << 12 | ps5vk_scale8(rgba[0], 15u) << 8 |
+                            ps5vk_scale8(rgba[1], 15u) << 4 | ps5vk_scale8(rgba[2], 15u);
+      memcpy(texel, &word, 2);
+      return 2;
+   }
+   case VK_FORMAT_A2B10G10R10_UNORM_PACK32: {
+      const uint32_t word = ps5vk_scale8(rgba[3], 3u) << 30 | ps5vk_scale8(rgba[2], 1023u) << 20 |
+                            ps5vk_scale8(rgba[1], 1023u) << 10 | ps5vk_scale8(rgba[0], 1023u);
+      memcpy(texel, &word, 4);
+      return 4;
+   }
+   case VK_FORMAT_A2B10G10R10_UINT_PACK32: {
+      const uint32_t word = ps5vk_scale8(rgba[3], 3u) << 30 | ps5vk_scale8(rgba[2], 1023u) << 20 |
+                            ps5vk_scale8(rgba[1], 1023u) << 10 | ps5vk_scale8(rgba[0], 1023u);
+      memcpy(texel, &word, 4);
+      return 4;
+   }
+   /* The integer families, one case a width: the block size alone does not name
+    * the component width -- an R8G8 texel is two bytes of *eight* bits each, not
+    * one of sixteen -- so each format carries the (bits, channels, signedness)
+    * ps5vk_integer_to_rgba8's decode names for it, and the encode is that
+    * function read backwards. */
+   case VK_FORMAT_R8_UINT:
+      return ps5vk_rgba8_from_integer(rgba, 8, 1, false, texel);
+   case VK_FORMAT_R8_SINT:
+      return ps5vk_rgba8_from_integer(rgba, 8, 1, true, texel);
+   case VK_FORMAT_R8G8_UINT:
+      return ps5vk_rgba8_from_integer(rgba, 8, 2, false, texel);
+   case VK_FORMAT_R8G8_SINT:
+      return ps5vk_rgba8_from_integer(rgba, 8, 2, true, texel);
+   case VK_FORMAT_R8G8B8A8_UINT:
+      return ps5vk_rgba8_from_integer(rgba, 8, 4, false, texel);
+   case VK_FORMAT_R8G8B8A8_SINT:
+      return ps5vk_rgba8_from_integer(rgba, 8, 4, true, texel);
+   case VK_FORMAT_A8B8G8R8_UINT_PACK32:
+      return ps5vk_rgba8_from_integer(rgba, 8, 4, false, texel);
+   case VK_FORMAT_A8B8G8R8_SINT_PACK32:
+      return ps5vk_rgba8_from_integer(rgba, 8, 4, true, texel);
+   case VK_FORMAT_R16_UINT:
+      return ps5vk_rgba8_from_integer(rgba, 16, 1, false, texel);
+   case VK_FORMAT_R16_SINT:
+      return ps5vk_rgba8_from_integer(rgba, 16, 1, true, texel);
+   case VK_FORMAT_R16G16_UINT:
+      return ps5vk_rgba8_from_integer(rgba, 16, 2, false, texel);
+   case VK_FORMAT_R16G16_SINT:
+      return ps5vk_rgba8_from_integer(rgba, 16, 2, true, texel);
+   case VK_FORMAT_R16G16B16A16_UINT:
+      return ps5vk_rgba8_from_integer(rgba, 16, 4, false, texel);
+   case VK_FORMAT_R16G16B16A16_SINT:
+      return ps5vk_rgba8_from_integer(rgba, 16, 4, true, texel);
+   case VK_FORMAT_R32_UINT:
+      return ps5vk_rgba8_from_integer(rgba, 32, 1, false, texel);
+   case VK_FORMAT_R32_SINT:
+      return ps5vk_rgba8_from_integer(rgba, 32, 1, true, texel);
+   case VK_FORMAT_R32G32_UINT:
+      return ps5vk_rgba8_from_integer(rgba, 32, 2, false, texel);
+   case VK_FORMAT_R32G32_SINT:
+      return ps5vk_rgba8_from_integer(rgba, 32, 2, true, texel);
+   case VK_FORMAT_R32G32B32A32_UINT:
+      return ps5vk_rgba8_from_integer(rgba, 32, 4, false, texel);
+   case VK_FORMAT_R32G32B32A32_SINT:
+      return ps5vk_rgba8_from_integer(rgba, 32, 4, true, texel);
+   default:
+      return 0;
+   }
+}
+
+uint32_t
+ps5vk_rgba8_texel_bytes(VkFormat format)
+{
+   uint8_t texel[16];
+   const uint8_t rgba[4] = {0, 0, 0, 255};
+   return ps5vk_rgba8_to_texel(format, rgba, texel);
+}
+
+/* One recorded image copy: the runs of the region, each side placed by its own
+ * map, moved at the split point. The walk is the one the recording used to do
+ * itself, run here instead so that one record holds a whole region -- a
+ * four-sample depth image's sixteen-byte texel is one run each, and expanding a
+ * 4K copy's 8.3 million runs into records needs more memory than an application
+ * has (the console run that found this is in docs/HARDWARE_FINDINGS.md). The
+ * run length is the largest span the map keeps contiguous (PS5VK_TILED_RUN_BYTES,
+ * ps5vk_private.h). */
+/* One pass of an image copy over its runs: evicting the source lines it will
+ * read, copying, or evicting the destination lines it wrote. */
+enum ps5vk_copy_pass { PS5VK_COPY_EVICT_SOURCE, PS5VK_COPY_RUNS, PS5VK_COPY_EVICT_DESTINATION };
+
+/* The bytes a side keeps contiguous along a row. A colour map keeps
+ * PS5VK_TILED_RUN_BYTES, but the one-byte map only eight: its address bits 0-2
+ * are x's and bit 3 is y's bit 1, so a sixteen-byte run moved half its texels
+ * from the row two below (R91: R8_UNORM's last two rows read back unwritten
+ * where that row lay past the image). The Z maps of a one-sample depth or
+ * stencil plane keep two texels -- x's low bit is the texel's own, and its next
+ * bit lies above
+ * y's low one (0x10 for four bytes, 0x8 for two, 0x4 for the one-byte stencil
+ * plane, ps5vk_image.c) -- and a four-sample depth texel is one sixteen-byte
+ * unit. A row-layout side keeps its whole row (R83: a one-sample depth side
+ * copied four texels a run, which scattered every other pair). */
+static uint64_t
+ps5vk_copy_side_run_bytes(const struct ps5vk_image_copy_side *side, uint32_t texel_bytes)
+{
+   if (!side->tiled)
+      return UINT64_MAX;
+   if (side->depth)
+      return side->samples == 4 ? texel_bytes : 2u * (uint64_t)side->element_bytes;
+   return side->element_bytes == 1u ? 8u : PS5VK_TILED_RUN_BYTES;
+}
+
+static void
+ps5vk_image_copy_pass(const struct ps5vk_memory_copy *copy, enum ps5vk_copy_pass pass)
+{
+   const uint32_t texel_bytes = copy->source_texel_bytes;
+   const uint64_t row_bytes = (uint64_t)copy->width * texel_bytes;
+   /* Two row-layout sides can copy a whole row at once. Tiled sides keep
+    * the measured contiguous run size so no memcpy crosses a tile boundary. */
+   const uint64_t run_bytes_limit =
+      MIN2(ps5vk_copy_side_run_bytes(&copy->source_side, texel_bytes),
+           ps5vk_copy_side_run_bytes(&copy->destination_side, texel_bytes));
+   const uint64_t run_texels = run_bytes_limit == UINT64_MAX
+                                  ? MAX2(copy->width, 1u)
+                                  : MAX2(run_bytes_limit / texel_bytes, 1u);
+   uint64_t last_line = UINT64_MAX;
+   for (uint32_t row = 0; row < copy->height; row++) {
+      for (uint64_t at = 0; at < row_bytes; at += run_texels * texel_bytes) {
+         const uint64_t run_bytes = MIN2(row_bytes - at, run_texels * texel_bytes);
+         const uint64_t source_at = pass == PS5VK_COPY_EVICT_DESTINATION ? 0 :
+            ps5vk_image_copy_address(&copy->source_side,
+                                     copy->source_x + (int32_t)(at / texel_bytes),
+                                     copy->source_y + (int32_t)row, texel_bytes, 0);
+         const uint64_t destination_at = pass == PS5VK_COPY_EVICT_SOURCE ? 0 :
+            ps5vk_image_copy_address(&copy->destination_side,
+                                     copy->destination_x + (uint32_t)(at / texel_bytes),
+                                     copy->destination_y + row, texel_bytes, 0);
+         if (pass != PS5VK_COPY_RUNS) {
+            /* A run lies within one line unless it is a whole row; a run in
+             * the line just evicted needs no second eviction. */
+            const uint64_t address = pass == PS5VK_COPY_EVICT_SOURCE ? source_at : destination_at;
+            if (run_bytes > 64 || (address >> 6) != last_line)
+               ps5vk_evict_cpu_lines((const void *)(uintptr_t)address, (size_t)run_bytes);
+            last_line = (address + run_bytes - 1) >> 6;
+            continue;
+         }
+         if (copy->reverse_texel_bytes == 0) {
+            memcpy((void *)(uintptr_t)destination_at, (const void *)(uintptr_t)source_at,
+                   (size_t)run_bytes);
+         } else {
+            /* A readback out of a reversed image: the four bytes of every texel
+             * swap as the run moves (ps5vk_format.storage_reversed). */
+            const uint8_t *const from = (const uint8_t *)(uintptr_t)source_at;
+            uint8_t *const to = (uint8_t *)(uintptr_t)destination_at;
+            for (uint64_t texel = 0; texel + texel_bytes <= run_bytes; texel += texel_bytes) {
+               for (uint32_t byte = 0; byte < texel_bytes; byte++)
+                  to[texel + byte] = from[texel + texel_bytes - 1u - byte];
+            }
+         }
+      }
+   }
+}
+
+/* A CPU image copy: every source line it reads is evicted first and every
+ * destination line it wrote after, as before, but in two sweeps with one fence
+ * each instead of an eviction and a fence around each 16-byte run. A 3840x2160
+ * readback (RetroArch's save-state thumbnail) took 972 ms that way and froze the
+ * game on every save (2026-09-24). */
+void
+ps5vk_image_copy_execute(const struct ps5vk_memory_copy *copy)
+{
+   ps5vk_image_copy_pass(copy, PS5VK_COPY_EVICT_SOURCE);
+   ps5vk_cpu_fence();
+   ps5vk_image_copy_pass(copy, PS5VK_COPY_RUNS);
+   ps5vk_image_copy_pass(copy, PS5VK_COPY_EVICT_DESTINATION);
+   ps5vk_cpu_fence();
+}
+
+/* R60: a command buffer whose recording the driver refused ends INVALID
+ * (vk_command_buffer_end), and submitting one is an application error the
+ * runtime asserts on (vk_queue_submit_add_command_buffer) -- Dolphin submitted
+ * one after an ubershader pipeline was refused, and the assert took the title
+ * down. The submission is refused with a result instead, naming why, and
+ * nothing in it runs. */
+VKAPI_ATTR VkResult VKAPI_CALL
+ps5vk_QueueSubmit2(VkQueue _queue, uint32_t submitCount, const VkSubmitInfo2 *pSubmits,
+                   VkFence fence)
+{
+   VK_FROM_HANDLE(vk_queue, queue, _queue);
+   for (uint32_t submit = 0; submit < submitCount; submit++) {
+      for (uint32_t at = 0; at < pSubmits[submit].commandBufferInfoCount; at++) {
+         VK_FROM_HANDLE(vk_command_buffer, cmd_buffer,
+                        pSubmits[submit].pCommandBufferInfos[at].commandBuffer);
+         if (cmd_buffer->state != MESA_VK_COMMAND_BUFFER_STATE_EXECUTABLE &&
+             cmd_buffer->state != MESA_VK_COMMAND_BUFFER_STATE_PENDING &&
+             cmd_buffer->state != MESA_VK_COMMAND_BUFFER_STATE_INITIAL)
+            return vk_errorf(queue, VK_ERROR_UNKNOWN,
+                             "command buffer %u of submission %u is not executable (state %d): "
+                             "its recording failed, so nothing in this submission runs",
+                             at, submit, (int)cmd_buffer->state);
+      }
+   }
+   return vk_common_QueueSubmit2(_queue, submitCount, pSubmits, fence);
+}
+
+VkResult
+ps5vk_queue_init(struct ps5vk_device *device, struct ps5vk_queue *queue,
+                 const VkDeviceQueueCreateInfo *info)
+{
+   VkResult result = vk_queue_init(&queue->vk, &device->vk, info, 0);
+   if (result != VK_SUCCESS)
+      return result;
+   /* Opt-in timing only; no command words or synchronization behavior change. */
+   FILE *profile = fopen("/app0/ps5vk-profile.txt", "rb");
+   queue->profile = (struct ps5vk_queue_profile){.enabled = profile != NULL ||
+                                                 getenv("PS5VK_PROFILE") != NULL};
+   if (profile)
+      fclose(profile);
+   queue->stamps = (struct ps5vk_direct_mapping){.start = -1};
+   queue->start_stamped = false;
+   queue->profile_windows = 0;
+   if (queue->profile.enabled) {
+      ps5vk_queue_probe_costs(&queue->profile);
+      ps5vk_hitch_armed = true;
+      /* The stamps are the profile's own: without them it runs as before. */
+      if (ps5vk_direct_mapping_create(&queue->stamps, PS5VK_STAMP_BYTES, PS5VK_STAMP_BYTES,
+                                      PS5VK_DIRECT_QUEUE) != 0)
+         ps5vk_direct_mapping_destroy(&queue->stamps);
+      else
+         memset(queue->stamps.address, 0, PS5VK_STAMP_BYTES);
+   }
+   queue->marker_value = 0;
+   queue->last_words = 0;
+   queue->last_stream = NULL;
+   queue->submitted_value = 0;
+   queue->completed_value = 0;
+   queue->ring_head = 0;
+   util_dynarray_init(&queue->retire, NULL);
+   if (mtx_init(&queue->lock, mtx_plain) != thrd_success) {
+      ps5vk_direct_mapping_destroy(&queue->stamps);
+      vk_queue_finish(&queue->vk);
+      return vk_error(device, VK_ERROR_OUT_OF_HOST_MEMORY);
+   }
+
+   const int32_t mapped = ps5vk_direct_mapping_create(&queue->submission, PS5VK_SUBMISSION_BYTES,
+                                                      PS5VK_SUBMISSION_BYTES, PS5VK_DIRECT_QUEUE);
+   if (mapped != 0) {
+      mtx_destroy(&queue->lock);
+      ps5vk_direct_mapping_destroy(&queue->stamps);
+      vk_queue_finish(&queue->vk);
+      return vk_errorf(device, VK_ERROR_OUT_OF_DEVICE_MEMORY,
+                       "the queue's submission buffer could not be mapped in the address "
+                       "window: 0x%08x", (unsigned)mapped);
+   }
+   /* The AGC helpers reserve more words than they write -- the wait packet 32
+    * against its 16 and the flip 64 against its 19 -- and the console leaves
+    * whatever the buffer held in the rest: a frame's wait carries the previous
+    * submission's words at that offset and a flip carries the frame's tail
+    * (runner pid 109, run pid 113; docs/M5_PHASE_C.md). Direct memory is
+    * recycled without being cleared, so the first submission's reserved words
+    * would otherwise hold another process's leftovers and the streams would
+    * not be reproducible. Zeroing once, here, leaves everything the helpers do
+    * not write a function of this queue's own submissions. */
+   memset(queue->submission.address, 0, (size_t)queue->submission.bytes);
+   /* Until the first submission the capture reads from the buffer's start,
+    * which is where the words of the first one will lie. */
+   queue->last_stream = queue->submission.address;
+   queue->marker = (uint32_t *)queue->submission.address +
+                   queue->submission.bytes / sizeof(uint32_t) - 1 -
+                   PS5VK_SWAPCHAIN_IMAGES * PS5VK_FLIP_SLOT_WORDS;
+   /* R70's fence: the eight-byte-aligned pair of words at least two below the
+    * marker, which no stream reaches (ps5vk_queue_run's capacity stops at it).
+    * The buffer was zeroed above. */
+   queue->fence = (uint32_t *)((uintptr_t)(queue->marker - 3) & ~(uintptr_t)7);
+   queue->fence_value = 0;
+
+   queue->vk.driver_submit = ps5vk_queue_submit;
+   return VK_SUCCESS;
+}
+
+void
+ps5vk_queue_finish(struct ps5vk_queue *queue)
+{
+   /* The GPU may still run the last submission (R69); its buffers go below. */
+   if (queue->submission.address != NULL && !vk_device_is_lost(queue->vk.base.device))
+      ps5vk_queue_wait_idle(queue);
+   vk_queue_finish(&queue->vk);
+   util_dynarray_fini(&queue->retire);
+   mtx_destroy(&queue->lock);
+   ps5vk_blit_pool_destroy(queue);
+   ps5vk_direct_mapping_destroy(&queue->submission);
+   ps5vk_direct_mapping_destroy(&queue->stamps);
+   free(queue->step_capture);
+}
+
+const uint32_t *
+ps5vk_debug_last_submission(VkDevice _device, uint32_t *dwords)
+{
+   VK_FROM_HANDLE(ps5vk_device, device, _device);
+   const bool queued = device != NULL && device->queue_initialized;
+   if (dwords != NULL)
+      *dwords = queued ? device->queue.last_words : 0;
+   return queued ? device->queue.last_stream : NULL;
+}
+
+uint32_t
+ps5vk_debug_submission_steps(VkDevice _device, ps5vk_debug_stage *steps, uint32_t capacity)
+{
+   VK_FROM_HANDLE(ps5vk_device, device, _device);
+   if (device == NULL || !device->queue_initialized || steps == NULL)
+      return 0;
+   const uint32_t count = device->queue.step_count;
+   for (uint32_t index = 0; index < count && index < capacity; index++) {
+      steps[index].address = (void *)(uintptr_t)device->queue.steps[index].stream;
+      steps[index].bytes = device->queue.steps[index].words * sizeof(uint32_t);
+   }
+   return count;
+}

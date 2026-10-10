@@ -1,0 +1,170 @@
+#!/usr/bin/env bash
+# PS5 OpenGL - OpenGL implementation for PlayStation 5.
+# Copyright (C) 2026 BlackBearReloaded
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+# Build the bounded Khronos OpenGL CTS runner as native title PPSA99005.
+
+set -euo pipefail
+
+root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+template=${PS5_NATIVE_APP_TEMPLATE:-"$root/../ps5-native-app-boilerplate"}
+cts=${VK_GL_CTS_ROOT:-"$root/third_party/VK-GL-CTS"}
+cts_build=${VK_GL_CTS_BUILD:-"$cts/build-ps5-gl33"}
+app=$(realpath -m -- "${PS5_CTS_APP_STAGE:-$root/build/native-app/PPSA99005-cts}")
+case "$app" in
+    "$root"/build/*) ;;
+    *) printf 'CTS app stage must be a subdirectory of %s/build\n' "$root" >&2; exit 2 ;;
+esac
+# Only generated source subdirectories may be replaced during a rebuild.
+for directory in src include vendor; do
+    [[ $(realpath -m -- "$app/$directory") == "$app/$directory" ]] || {
+        printf 'Refusing a redirected CTS stage directory: %s\n' "$app/$directory" >&2
+        exit 2
+    }
+done
+
+[[ -f "$template/Makefile" && -d "$template/.deps/native" ]] || {
+    printf 'native-app boilerplate or dependencies are missing: %s\n' \
+        "$template" >&2
+    exit 2
+}
+
+sdk="$template/.deps/native/ps5-payload-sdk"
+export PS5_PAYLOAD_SDK="$sdk"
+bash "$root/toolchain/build-opengnm-psbc-ps5.sh" --if-needed
+"$root/conformance/vk-gl-cts/prepare.sh" "$cts"
+bash "$root/conformance/vk-gl-cts/verify-source.sh" "$cts"
+if [[ ! -f "$cts_build/build.ninja" ]]; then
+    cmake -S "$cts" -B "$cts_build" -G Ninja \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DDEQP_TARGET=ps5 \
+        -DDEQP_TARGET_TOOLCHAIN=ps5-toolchain \
+        -DSELECTED_BUILD_TARGETS=ps5-gl33-runner \
+        -DDEQP_DISABLE_VK_VIDEO_TESTS=ON
+fi
+cmake --build "$cts_build" --target ps5-gl33-runner -j8
+
+runner="$cts_build/external/openglcts/modules/libps5-gl33-runner.a"
+test -s "$runner"
+
+if [[ -n ${PS5_OPENGL_PREFIX:-} ]]; then
+    # Match renderer gates: validate the exact installed SDK instead of rebuilding it.
+    prefix=$(realpath -e -- "$PS5_OPENGL_PREFIX")
+    (cd "$prefix" && sha256sum --check --strict manifest.sha256 >/dev/null)
+    opengl_libraries=("$prefix/lib/libPS5OpenGLCore33.a")
+else
+    make -C "$root/tests/ps5" --no-print-directory -f native-app.mk -j8 \
+        PS5_PAYLOAD_SDK="$sdk" runtime
+    mapfile -t opengl_libraries < <(
+    make -C "$root/tests/ps5" --no-print-directory -s -f native-app.mk \
+        PS5_PAYLOAD_SDK="$sdk" print-static-libs
+    )
+fi
+mapfile -d '' -t cts_libraries < <(
+    find "$cts_build" -type f -name '*.a' -print0 | sort -z
+)
+
+compiler=${PS5_CLANG:-clang-18}
+compiler_runtime=$(
+    "$compiler" --print-resource-dir
+)/lib/linux/libclang_rt.builtins-x86_64.a
+static_libraries=(
+    "${cts_libraries[@]}"
+    "${opengl_libraries[@]}"
+    "$sdk/target/lib/libunwind.a"
+    "$sdk/target/lib/libc++abi.a"
+    "$sdk/target/lib/libc++.a"
+    "$compiler_runtime"
+)
+for library in "${static_libraries[@]}"; do
+    test -s "$library"
+done
+
+mkdir -p "$app"
+cp "$template/Makefile" "$app/Makefile"
+for directory in assets runtime sce_sys tooling tools; do
+    mkdir -p "$app/$directory"
+    cp -a "$template/$directory/." "$app/$directory/"
+done
+heap_source="$app/tooling/native/sce_module_writer.cpp"
+heap_default='write_u64(result.data, result.heap_size, std::numeric_limits<std::uint64_t>::max());'
+test "$(grep -Fc "$heap_default" "$heap_source")" = 1
+sed -i "s/$heap_default/write_u64(result.data, result.heap_size, 0x10000000ULL);/" \
+    "$heap_source"
+link_script="$app/tools/build.sh"
+link_marker='--eh-frame-hdr \'
+test "$(grep -Fc -- "$link_marker" "$link_script")" = 1
+sed -i 's/--eh-frame-hdr \\/--eh-frame-hdr --wrap=malloc --wrap=calloc --wrap=realloc --wrap=free --wrap=posix_memalign --wrap=malloc_usable_size \\/' \
+    "$link_script"
+cp "$template/tooling/native/ps5-pie.ld" \
+    "$app/tooling/native/ps5-pie-base.ld"
+cp "$root/native-app/ps5-pie.ld" "$app/tooling/native/ps5-pie.ld"
+cp "$root/native-app/app-symbols.map" "$app/tooling/native/app-symbols.map"
+rm -rf -- "$app/src" "$app/include" "$app/vendor"
+mkdir -p "$app/src" "$app/include" "$app/vendor"
+cp "$root/native-app/runtime_shims.c" "$app/src/runtime_shims.c"
+cp "$root/native-app/cts_runtime_shims.c" "$app/src/cts_runtime_shims.c"
+cp "$root/native-app/app_heap.c" "$app/src/app_heap.c"
+if [[ ${PS5_GPU_MEMORY_PROFILE:-0} == 1 ]]; then
+    cp "$root/native-app/gpu_memory.c" "$app/src/gpu_memory.c"
+    sed -i 's/--wrap=malloc /--wrap=sceKernelAllocateDirectMemory --wrap=sceKernelMapDirectMemory --wrap=sceKernelReleaseDirectMemory --wrap=munmap --wrap=malloc /' "$link_script"
+fi
+for headers in EGL GL KHR; do
+    cp -a "$root/third_party/mesa-26.2.0/include/$headers" "$app/include/"
+done
+cp "$root/native-app/param.json" "$app/sce_sys/param.json"
+display_args=(--fps "${PS5_SCANOUT_FPS:-60}")
+if [[ -n ${prefix:-} ]]; then
+    display_args+=(--sdk-prefix "$prefix")
+fi
+python3 "$root/tools/native-display-metadata.py" "$app/sce_sys/param.json" "${display_args[@]}"
+
+group="$app/vendor/libps5_opengl_cts_group.a"
+{
+    printf 'SEARCH_DIR("%s")\n' "$sdk/target/lib"
+    printf 'EXTERN(main)\n'
+    printf 'EXTERN(ps5_agc_gate2_run)\n'
+    printf 'GROUP (\n'
+    printf '  "%s"\n' "${static_libraries[@]}"
+    printf ')\n'
+} > "$group"
+printf 'APP_INCLUDE_PATHS = include\nAPP_STATIC_ARCHIVES = vendor/libps5_opengl_cts_group.a\n' \
+    > "$app/.env"
+
+if [[ ! -f "$app/.deps/native/.cts-copy-complete" ]]; then
+    # A paused copy may contain the linker but lack headers. Copy contents on
+    # resume (never nest native/native), and mark ready only after success.
+    mkdir -p "$app/.deps/native"
+    cp -a "$template/.deps/native/." "$app/.deps/native/"
+    touch "$app/.deps/native/.cts-copy-complete"
+fi
+
+app_sdk="$app/.deps/native/ps5-payload-sdk"
+mkdir -p "$app/build/native-imports"
+PS5_PAYLOAD_SDK="$app_sdk" sh "$app/tooling/prospero-clang18" \
+    -std=c11 -O2 -fPIC -ffunction-sections -fdata-sections \
+    -c "$root/native-app/agc_link_stub.c" \
+    -o "$app/build/native-imports/agc_link_stub.o"
+"$app_sdk/bin/prospero-lld" --shared -soname libSceAgc.prx \
+    -o "$app_sdk/target/lib/libSceAgc.so" \
+    "$app/build/native-imports/agc_link_stub.o"
+PS5_PAYLOAD_SDK="$app_sdk" sh "$app/tooling/prospero-clang18" \
+    -std=c11 -O2 -fPIC -ffunction-sections -fdata-sections \
+    -c "$root/native-app/agc_driver_link_stub.c" \
+    -o "$app/build/native-imports/agc_driver_link_stub.o"
+"$app_sdk/bin/prospero-lld" --shared -soname libSceAgcDriver.prx \
+    -o "$app_sdk/target/lib/libSceAgcDriver.so" \
+    "$app/build/native-imports/agc_driver_link_stub.o"
+
+make -C "$app" --no-print-directory -j8 app
+
+dist="$app/dist/PPSA99005"
+cp "$root/conformance/vk-gl-cts/native/cts-args.txt" "$dist/cts-args.txt"
+cp -a "$cts/external/openglcts/data/gl_cts" "$dist/gl_cts"
+
+printf 'Native CTS app: %s\n' "$dist"
+printf 'VK-GL-CTS commit: %s\n' "$(git -C "$cts" rev-parse HEAD)"
+printf 'Native boilerplate commit: %s\n' \
+    "$(git -c safe.directory="$template" -C "$template" rev-parse HEAD)"
+"$root/tools/verify-native-cts-app.sh" "$app"

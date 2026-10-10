@@ -1,0 +1,1 @@
+(AI-assisted) Available source snapshots of the tested public driver/tooling environment. SDK/third-party binary caches are excluded. Some upstream dependencies must still be fetched and prepared using their own build scripts. See the project BUILDING.md for exact pins and layout.

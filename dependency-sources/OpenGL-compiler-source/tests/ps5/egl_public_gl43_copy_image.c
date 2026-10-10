@@ -1,0 +1,6 @@
+// PS5 OpenGL - OpenGL implementation for PlayStation 5.
+// Copyright (C) 2026 BlackBearReloaded
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+#define PS5_GL43_COPY_IMAGE_TEST 1
+#include "egl_public_core33_texture_copy.c"

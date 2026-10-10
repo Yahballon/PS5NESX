@@ -1,0 +1,38 @@
+#version 460
+/*
+ * PS5 Vulkan - RADV smoke test: mesh workgroups that read their task's payload.
+ * Copyright (C) 2026 Mihawk-99
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ *
+ * Mesh workgroup m of task workgroup t paints the 2-pixel cell t * 2 + m of a
+ * 128-cell-wide grid in a colour that names t and m, and in a colour with blue
+ * when the payload's first word does not match its last.
+ */
+#extension GL_EXT_mesh_shader : require
+
+layout(local_size_x = 4) in;
+layout(triangles, max_vertices = 4, max_primitives = 2) out;
+
+struct Payload {
+    uint words[4096];
+};
+taskPayloadSharedEXT Payload payload;
+layout(location = 0) perprimitiveEXT out vec4 colour[];
+
+void main()
+{
+    const uint task = payload.words[4095];
+    const bool whole = payload.words[0] == (task ^ 0x5a5au);
+    const uint cell = task * 2u + gl_WorkGroupID.x;
+    const uvec2 origin = uvec2(cell % 128u, cell / 128u) * 2u;
+
+    SetMeshOutputsEXT(4, 2);
+    const uint v = gl_LocalInvocationIndex;
+    const vec2 pixel = vec2(origin + uvec2(v & 1u, v >> 1u) * 2u);
+    gl_MeshVerticesEXT[v].gl_Position = vec4(pixel / 128.0 - 1.0, 0.0, 1.0);
+    if (v < 2u) {
+        gl_PrimitiveTriangleIndicesEXT[v] = v == 0u ? uvec3(0, 1, 3) : uvec3(0, 3, 2);
+        colour[v] = vec4(float(task & 255u) / 255.0, float((task >> 8u) | (gl_WorkGroupID.x << 7u)) / 255.0,
+                         whole ? 0.0 : 1.0, 1.0);
+    }
+}
