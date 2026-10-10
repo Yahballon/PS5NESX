@@ -1,4 +1,5 @@
 # PS5NES
+PS5NES is a native PS5 homebrew NES emulator using **FCEUmm**. It keeps the PS5SX2 shelf, animated game cases, cover glow, reflections, menu sounds and settings panel, with a NES backend.
 **NES games on your PS5, with the original PS5SX2 cover-flow interface.**
 
 **v1.0.0.9 — by YAHBALLON** · **App ID: PPSA99204**
@@ -6,8 +7,6 @@
 <p align="center">
   <img src="screenshots/background.png" alt="PS5NES game shelf">
 </p>
-
-(AI-assisted) PS5NES is a native PS5 homebrew NES emulator using **FCEUmm**. It keeps the PS5SX2 shelf, animated game cases, cover glow, reflections, menu sounds and settings panel, with a NES backend.
 
 ## Features
 
