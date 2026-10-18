@@ -1,4 +1,4 @@
-# PS5NES
+# PS5NES is a passion project, not a piracy project.
 <p align="center">
   <img src="screenshots/background.png" alt="PS5NES game shelf">
 </p>
