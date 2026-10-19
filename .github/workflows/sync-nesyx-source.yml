@@ -1,0 +1,57 @@
+# Import the already PS5-tested NESYX v1.0.27 source tree, including PNGs.
+# The destination README, build workflow and unrelated legacy source are preserved.
+name: Import NESYX v1.0.27 Source
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/sync-nesyx-source.yml']
+permissions:
+  contents: write
+concurrency:
+  group: nesyx-source-import
+  cancel-in-progress: false
+jobs:
+  import:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+      - name: Sync verified NESYX source and binary assets
+        shell: bash
+        env:
+          SOURCE_COMMIT: 34be9411c3949435a347ab3577259d83f5322fb8
+        run: |
+          set -euo pipefail
+          src="$RUNNER_TEMP/nesyx-source"
+          git clone --quiet --filter=blob:none --no-checkout --depth=1 https://github.com/Yahballon/tmp_lap.git "$src"
+          git -C "$src" fetch --quiet --depth=1 origin "$SOURCE_COMMIT"
+          git -C "$src" sparse-checkout set homebrew/ps5nesx
+          git -C "$src" checkout --quiet --detach "$SOURCE_COMMIT"
+          test "$(git -C "$src" rev-parse HEAD)" = "$SOURCE_COMMIT"
+          test -s "$src/homebrew/ps5nesx/app.json"
+          test "$(git hash-object "$src/homebrew/ps5nesx/ps5/frontend/assets/no-cover.png")" = a6c9fa9226e8bf505ce634ed0eaa9b3168b2f152
+          test "$(git hash-object "$src/homebrew/ps5nesx/ps5/frontend/assets/tiger-logo.png")" = e2dceac5870cee1be1383ced20ffdf3e264c98ef
+          # The existing beautiful README and standalone workflows belong to this repo.
+          rsync -a --exclude='/README.md' --exclude='/TMP_LAP.md' --exclude='__pycache__/'             "$src/homebrew/ps5nesx/" "$GITHUB_WORKSPACE/"
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          meta=json.loads(Path('app.json').read_text())
+          assert meta['name']=='NESYX' and meta['version']=='1.0.27'
+          assert meta['titleId']=='PPSA99204'
+          assert Path('ps5/porpoise_original/src/ui_gfx.cpp').is_file()
+          assert Path('ps5/frontend/assets/no-cover.png').stat().st_size == 3000363
+          print('Validated NESYX native source and original 3 MB cover asset')
+          PY
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A .
+          if ! git diff --cached --quiet; then
+            git commit -m "sync: NESYX v1.0.27 native source and assets from tested tmp_lap"
+            git push origin HEAD:main
+          else
+            echo "NESYX source already up to date."
+          fi

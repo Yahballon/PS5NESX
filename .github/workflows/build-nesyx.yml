@@ -1,0 +1,311 @@
+name: NESYX Native Build & Release
+on:
+  workflow_dispatch:
+  workflow_run:
+    workflows: ['Import NESYX v1.0.27 Source']
+    types: [completed]
+  push:
+    branches: [main]
+    paths:
+      - 'nes/**'
+      - 'ps5/**'
+      - '3rdparty/**'
+      - 'app.json'
+      - 'tests/**'
+permissions: 
+
+  contents: write
+concurrency:
+  group: ps5nesx-native-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  build:
+    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 355
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify imported source and release version
+        id: info
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -s nes/tools/build_shelf.py
+          test -s ps5/frontend/fe_app.cpp
+          python3 - <<'PY'
+          import json,os,re
+          from pathlib import Path
+          x=json.loads(Path('app.json').read_text())
+          assert x['titleId']=='PPSA99204' and x['slug']=='ps5nesx'
+          assert re.fullmatch(r'\d+\.\d+\.\d+',x['version'])
+          assert x['releaseTag']==f"ps5nesx-v{x['version']}"
+          with open(os.environ['GITHUB_OUTPUT'],'a') as o:
+              o.write(f"version={x['version']}\n")
+              o.write(f"tag={x['releaseTag']}\n")
+          print('Build native NESYX',x['releaseTag'])
+          PY
+      - name: Test Wii-style CoverFlow geometry on host
+        run: |
+          g++ -std=c++20 -O2 -Wall -Wextra -Werror \
+            -Ips5/frontend \
+            tests/coverflow_layout_test.cpp \
+            -o /tmp/ps5nesx-layout-test
+          /tmp/ps5nesx-layout-test
+          g++ -std=c++20 -O2 -Wall -Wextra -Werror \
+            -Ips5/frontend \
+            tests/porpoise_coverflow_test.cpp \
+            -o /tmp/ps5nesx-porpoise-layout-test
+          /tmp/ps5nesx-porpoise-layout-test
+          python3 tests/test_porpoise_integration.py
+          python3 tests/test_porpoise_visible.py
+          python3 tests/test_fullres_no_cover.py
+          python3 tests/test_loading_and_exit.py
+          python3 tests/test_pixel_reactor.py
+          g++ -std=c++20 -O2 -Wall -Wextra -Werror -Ines/src tests/test_game_viewport.cpp -o /tmp/nesyx-viewport-test
+          /tmp/nesyx-viewport-test
+          python3 tests/test_porpoise_texture_uv.py
+          g++ -std=c++20 -O2 -Wall -Wextra -Werror \
+            -Ips5/frontend \
+            -Ines/src \
+            tests/coverflow_navigation_test.cpp \
+            -o /tmp/ps5nesx-nav-covers-test
+          /tmp/ps5nesx-nav-covers-test
+          python3 tests/test_nav_settings_cache.py
+          g++ -std=c++20 -O2 -Wall -Wextra -Werror -pthread \
+            -Ips5/frontend -Ines/src \
+            tests/arcadeartwork_catalog_test.cpp \
+            -o /tmp/ps5nesx-arcadeartwork-test
+          /tmp/ps5nesx-arcadeartwork-test
+          python3 tests/test_cover_progress_overlay.py
+          g++ -std=c++20 -O2 -Wall -Wextra -Werror -pthread \
+            -Ips5/frontend -Ines/src \
+            tests/libretro_catalog_test.cpp \
+            -o /tmp/ps5nesx-libretro-catalog-test
+          /tmp/ps5nesx-libretro-catalog-test
+          python3 tests/test_libretro_progress.py
+          python3 tests/test_porpoise_themes.py
+          python3 tests/ui_layout_check.py
+          python3 tests/test_hdpack_integration.py
+          python3 tests/test_hd_visual_regressions.py
+      - name: Install toolchain packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            git wget curl unzip zip make cmake ninja-build clang-18 lld-18 llvm-18 \
+            build-essential pkg-config meson glslang-tools zstd bison flex \
+            libssl-dev libzstd-dev libx11-dev libgl1-mesa-dev \
+            python3 python3-mako python3-numpy python3-pil
+          echo '/usr/lib/llvm-18/bin' >> "$GITHUB_PATH"
+      - name: Embed verified Porpoise cover navigation sounds
+        shell: bash
+        run: |
+          set -euo pipefail
+          rev=2ed1ab5a06995aa198f7bccd4da0f90c3fc29d39
+          root="$GITHUB_WORKSPACE/ps5/frontend/assets/sounds"
+          mkdir -p "$root"
+          for entry in \
+            'game-row.wav d10d7d6ef5f8cb7343539e8aafb57fcb49f90a0f' \
+            'menu-scroll.wav abab02c03a9a8181f3c81ad6d027de6b9940213a'; do
+            read -r name expected <<< "$entry"
+            curl -fL --retry 5 --retry-all-errors --connect-timeout 20 \
+              "https://raw.githubusercontent.com/elripalda/Porpoise-Dolphin-Emulator-for-PS5/$rev/assets/sounds/$name" \
+              -o "$root/$name"
+            test "$(git hash-object "$root/$name")" = "$expected" || { echo "Porpoise WAV hash mismatch: $name" >&2; exit 1; }
+          done
+          python3 - <<'PY'
+          import wave
+          from pathlib import Path
+          root=Path("ps5/frontend/assets/sounds")
+          for name in ("game-row.wav", "menu-scroll.wav"):
+              with wave.open(str(root/name),'rb') as f:
+                  assert f.getnchannels()==2 and f.getframerate()==48000 and f.getsampwidth()==2
+                  assert 0 < f.getnframes() <= 48000*3
+                  print("Verified Porpoise sound:",name,"frames=",f.getnframes())
+          PY
+      - name: Rebuild modified native background SPIR-V
+        run: |
+          bash ps5/frontend/build_shaders.sh
+          test -s ps5/frontend/fe_shaders.inc
+          grep -q 'static const uint32_t fe_spv_bg_frag\[\]' ps5/frontend/fe_shaders.inc
+      - name: Rebuild Porpoise text and cover sampling shader for PS5
+        run: |
+          python3 ps5/porpoise_original/tools/rebuild_shader.py
+          test -s ps5/porpoise_original/src/ui_frag.inc
+      - name: Prepare exact Porpoise renderer include dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          src=ps5/porpoise_original/src
+          third=ps5/frontend/third_party
+          mkdir -p "$src/stb"
+          cp "$third/stb_image.h" "$src/stb/stb_image.h"
+          cp "$third/stb_truetype.h" "$src/stb/stb_truetype.h"
+          # Original vertex shader preserved; fragment shader has the PS5 UV fix.
+          test -s "$src/ui_frag.inc" && test -s "$src/ui_vert.inc"
+          root=ps5/porpoise_original/assets
+          mkdir -p "$root/fonts" "$root/brand" "$root/ui"
+          rev=2ed1ab5a06995aa198f7bccd4da0f90c3fc29d39
+          for spec in \
+            'fonts/Nunito-Regular.ttf 2f4a2f8467657c1f039800f7af0f85d719d92bf6' \
+            'fonts/Nunito-SemiBold.ttf 2588d394a7b5773e8355c1d923877bef338f2adf' \
+            'fonts/Nunito-Bold.ttf c642a28adb3b5b89bc37dca9b76b81fa114c022b' \
+            'fonts/Nunito-ExtraBold.ttf 5dab2fd42d061b7f69ecbee7ac3f73d50053978c' \
+            'fonts/NotoSansJP-Porpoise.ttf e18162d7dd500a08d301b91949c6aa9a0c94907e' \
+            'brand/dolphin-mask.png bd51e74f7e11c79de9d40d626d3685038cf5d792' \
+            'ui/buttons.png 43902f0bccdab08fb74efb0a99ae3f282299543a'; do
+            read -r name expected <<< "$spec"
+            curl -fL --retry 5 --retry-all-errors --connect-timeout 15 \
+              "https://raw.githubusercontent.com/elripalda/Porpoise-Dolphin-Emulator-for-PS5/$rev/assets/$name" \
+              -o "$root/$name"
+            test "$(git hash-object "$root/$name")" = "$expected" || exit 1
+          done
+          # Compile the pinned original font and icon assets into eboot.bin;
+          # /app0 paths are not available to every homebrew launch mode.
+          mkdir -p ps5/frontend/assets/porpoise
+          cp -R "$root/." ps5/frontend/assets/porpoise/
+          curl -fL --retry 5 \
+            "https://raw.githubusercontent.com/elripalda/Porpoise-Dolphin-Emulator-for-PS5/$rev/assets/fonts/OFL.txt" \
+            -o "$root/fonts/OFL.txt"
+      - name: Verify exact upstream source hashes
+        run: |
+          set -euo pipefail
+          root=ps5/porpoise_original/src
+          test "$(git hash-object "$root/ui_app_views.cpp")" = a98f455313dd926238c9d76a72d5fd7f50e6ee2d
+          # Original Gfx now has additional stage-specific startup diagnostics
+          # Original glass and vertex pipeline remain unchanged. Only the
+          # textured UV reconstruction in PS5NESX's fragment shader differs.
+          grep -q 'original Vulkan pipeline FAILED' "$root/ui_gfx.cpp"
+          grep -q 'original font atlas FAILED' "$root/ui_gfx.cpp"
+          grep -q 'const uint32_t porpoise_ui_frag\[\]' "$root/ui_frag.inc"
+          grep -q 'texture(tex, mix(v_p2.xy, v_p2.zw, v_local))' ps5/porpoise_original/shaders/ui.frag
+      - name: Verify embedded font assets in standalone source
+        shell: bash
+        run: |
+          test "$(git hash-object bin/resources/fonts/Roboto-Regular.ttf)" = 500b1045b0c94d83d2e6798aaf1faa55a2dab6fc
+          test "$(git hash-object bin/resources/fonts/promptfont.otf)" = 77f8d39a6d3700494bb133c5f0ec67c762794ffa
+      - name: Restore native PS5 graphics cache shared with MesenX
+        id: graphics
+        uses: actions/cache/restore@v4
+        with:
+          path: build/deps
+          key: nesyx-graphics-v1-${{ hashFiles('scripts/bootstrap_native.sh') }}
+      - name: Bootstrap pinned PS5 Vulkan and payload SDK when not cached
+        if: steps.graphics.outputs.cache-hit != 'true'
+        timeout-minutes: 280
+        run: bash scripts/bootstrap_native.sh
+      - name: Save native graphics cache for reuse
+        if: steps.graphics.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: build/deps
+          key: nesyx-graphics-v1-${{ hashFiles('scripts/bootstrap_native.sh') }}
+      - name: Resolve PS5NESX network and filesystem dependencies
+        timeout-minutes: 70
+        shell: bash
+        run: |
+          set -euo pipefail
+          root="$GITHUB_WORKSPACE/homebrew/ps5nesx"
+          deps="$root/deps"
+          mkdir -p "$deps"
+          ln -s "$GITHUB_WORKSPACE/build/deps/PS5_Vulkan" "$deps/PS5_Vulkan"
+          test -s "$deps/PS5_Vulkan/build/driver/ps5/libps5vk.ps5.a"
+          git clone -q --depth 1 --branch libnfs-5.0.3 \
+            https://github.com/sahlberg/libnfs.git "$deps/libnfs"
+          bash "$root/ps5/tools/build-libnfs.sh" \
+            "$deps/libnfs" "$deps/libnfs-output" \
+            "$deps/PS5_Vulkan/.deps/native/ps5-payload-sdk/toolchain/prospero.cmake"
+          git clone -q --depth 1 \
+            https://github.com/blackbearreloaded/ps5-native-app-boilerplate.git \
+            "$deps/filesystem-helper"
+          bash "$deps/filesystem-helper/tools/setup-pacbrew-dependencies.sh" --resolve libcurl
+          for lib in curl psl ssl crypto zstd z; do
+            test -s "$deps/filesystem-helper/.deps/pacbrew/v0.40.2/sysroot/user/homebrew/lib/lib$lib.a"
+          done
+          test -s "$deps/libnfs-output/install/lib/libnfs.a"
+      - name: Build missing native PSBC objects and AGC link imports
+        timeout-minutes: 40
+        env:
+          PS5_VULKAN_DIR: ${{ github.workspace }}/build/deps/PS5_Vulkan
+          PS5_PAYLOAD_SDK: ${{ github.workspace }}/build/deps/PS5_Vulkan/.deps/native/ps5-payload-sdk
+        run: |
+          python3 scripts/build_generated_psbc.py
+          python3 scripts/build_agc_imports.py
+          test -s build/ps5-core/generated-psbc.ps5.a
+          test -s build/ps5-core/agc-imports/libSceAgc.so
+          test -s build/ps5-core/agc-imports/libSceAgcDriver.so
+      - name: Restore signed prior Lapy helper (source no longer public)
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/ps5nesx-helper-baseline"
+          gh release download ps5nesx-v1.0.11 --repo "Yahballon/tmp_lap" --pattern PPSA99204.zip --dir "$RUNNER_TEMP/ps5nesx-helper-baseline"
+          echo "1dca2ad14d5e02f71eb8e2a71b527b92297f060a79d5df9b4613f01ff51d8500  $RUNNER_TEMP/ps5nesx-helper-baseline/PPSA99204.zip" | sha256sum -c -
+          unzip -Z1 "$RUNNER_TEMP/ps5nesx-helper-baseline/PPSA99204.zip" | grep -Fx 'PPSA99204/lapy.elf'
+          unzip -Z1 "$RUNNER_TEMP/ps5nesx-helper-baseline/PPSA99204.zip" | grep -Fx 'PPSA99204/lapy-manifest.json'
+      - name: Build and sign NESYX from standalone repository
+        timeout-minutes: 110
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE"
+          export PS5NES_DEPS="$PWD/deps"
+          export PS5_PAYLOAD_SDK="$PS5NES_DEPS/PS5_Vulkan/.deps/native/ps5-payload-sdk"
+          export LIBNFS_PREFIX="$PS5NES_DEPS/libnfs-output/install"
+          export LIBZ_PREFIX="$PS5NES_DEPS/filesystem-helper/.deps/pacbrew/v0.40.2/sysroot/user/homebrew"
+          export PS5NES_PSBC_GENERATED="$GITHUB_WORKSPACE/build/ps5-core/generated-psbc.ps5.a"
+          export PS5NES_AGC_STUB_DIR="$GITHUB_WORKSPACE/build/ps5-core/agc-imports"
+          export PS5NES_LAPY_BASELINE="$RUNNER_TEMP/ps5nesx-helper-baseline/PPSA99204.zip"
+          # build_shelf.py generates the UI version and title metadata from app.json.
+          bash nes/tools/build.sh
+          mkdir -p dist
+          python3 - <<'PY'
+          import zipfile,json,struct
+          from pathlib import Path
+          src=list(Path('nes/build-shelf').glob('NESYX-v*-by-YAHBALLON.zip'))
+          assert len(src)==1,src
+          meta=json.loads(Path('app.json').read_text())
+          version=meta['version']
+          assert src[0].name==f'NESYX-v{version}-by-YAHBALLON.zip'
+          dst=Path('dist/PPSA99204.zip')
+          dst.write_bytes(src[0].read_bytes())
+          assert dst.stat().st_size>1_000_000
+          with zipfile.ZipFile(dst) as archive:
+              assert archive.testzip() is None
+              for name in ['PPSA99204/eboot.bin','PPSA99204/sce_module/libc.prx',
+                           'PPSA99204/sce_sys/icon0.png','PPSA99204/lapy.elf',
+                           'PPSA99204/lapy-manifest.json']:
+                  assert name in archive.namelist(),name
+              param=json.loads(archive.read('PPSA99204/sce_sys/param.json'))
+              assert param['titleId']=='PPSA99204'
+              major,minor,patch=map(int,version.split('.'))
+              assert param['contentVersion']==f'{major:02d}.{minor:03d}.{patch:03d}'
+              manifest=json.loads(archive.read('PPSA99204/build-manifest.json'))
+              assert manifest['version']==version and manifest['build_tag']==f'v{version} by YAHBALLON'
+              assert archive.read('PPSA99204/eboot.bin')[:4]==struct.pack('<I',0x1D3D154F)
+          print('Validated signed NESYX release',dst.stat().st_size)
+          PY
+      - name: Upload installable PS5 TESTBUILD ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: NESYX-${{ steps.info.outputs.version }}-PPSA99204
+          path: dist/PPSA99204.zip
+          if-no-files-found: error
+      - name: Publish immutable versioned GitHub Release for TESTBUILDS
+        if: github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.info.outputs.tag }}
+          VERSION: ${{ steps.info.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release $TAG already exists. Bump app.json version for a new TESTBUILD." >&2
+            exit 1
+          fi
+          gh release create "$TAG" dist/PPSA99204.zip \
+            --repo "$GITHUB_REPOSITORY" --target main \
+            --title "NESYX v$VERSION by YAHBALLON" \
+            --notes "Native NESYX source built from Yahballon/PS5NESX. Install PPSA99204.zip. Core: FCEUmm."
