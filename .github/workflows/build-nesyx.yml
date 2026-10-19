@@ -60,6 +60,7 @@ jobs:
           python3 tests/test_porpoise_visible.py
           python3 tests/test_fullres_no_cover.py
           python3 tests/test_loading_and_exit.py
+          python3 tests/test_nesyx_shell_exit.py
           python3 tests/test_pixel_reactor.py
           g++ -std=c++20 -O2 -Wall -Wextra -Werror -Ines/src tests/test_game_viewport.cpp -o /tmp/nesyx-viewport-test
           /tmp/nesyx-viewport-test

@@ -9,6 +9,23 @@
 #include <sys/stat.h>
 #include <unistd.h>
 extern "C" int sceNetInit();
+extern "C" int sceSystemServiceLoadExec(const char* path,const char* const* argv);
+extern "C" int sceKernelUsleep(unsigned int microseconds);
+
+// Native PS5 titles are closed by the shell. Calling libc exit() crashes
+// with SIGSYS (12) on this console. Override the CRT main-return handler too.
+extern "C" [[noreturn]] void nesyx_exit_to_shell(const char* reason) {
+    std::printf("[NESYX] PS5 shell exit requested: %s\n",reason?reason:"unknown");
+    std::fflush(nullptr);
+    const int rc=sceSystemServiceLoadExec("exit",nullptr);
+    std::printf("[NESYX] LoadExec returned rc=0x%08x; waiting for system\n",unsigned(rc));
+    std::fflush(nullptr);
+    for(;;)sceKernelUsleep(100000);
+}
+extern "C" [[noreturn]] void catchReturnFromMain(int status) {
+    std::printf("[NESYX] CRT returned status=%d\n",status);
+    nesyx_exit_to_shell("CRT main return");
+}
 int main() {
     sceNetInit();
     const auto access=elevation::request(elevation::Capability::filesystem);
@@ -33,5 +50,5 @@ int main() {
     orbis_frontend_set_language(root+"/lang");
     orbis_web_start(paths,nes_build::kBuildTag);
     bool ran=false;orbis_frontend_run(paths,nes_build::kBuildTag,&ran);
-    for(;;)sleep(1);
+    nesyx_exit_to_shell("frontend completed");
 }

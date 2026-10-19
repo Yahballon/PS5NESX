@@ -5,7 +5,7 @@
 <h1 align="center">NESYX</h1>
 <p align="center"><strong>Native NES emulation for a jailbroken PlayStation 5</strong><br>
 Retro games. Neon covers. Modern PS5 homebrew.<br>
-<sub>v1.0.27 · by YAHBALLON · Title ID PPSA99204</sub></p>
+<sub>v1.0.28 · by YAHBALLON · Title ID PPSA99204</sub></p>
 
 <p align="center">
   <a href="https://github.com/Yahballon/PS5NESX/actions/workflows/build-nesyx.yml"><img alt="Native build" src="https://github.com/Yahballon/PS5NESX/actions/workflows/build-nesyx.yml/badge.svg"></a>
@@ -28,6 +28,10 @@ Retro games. Neon covers. Modern PS5 homebrew.<br>
 | **ROM sources** | Internal storage, USB and NFS shares; NES, UNIF and compatible single-game ZIP files |
 | **Safe exit** | Press **○** in the library to open the exit confirmation; **× Yes**, **○ No** |
 | **HD packs (experimental)** | Mesen-format `hires.txt` support where compatible; not all packs are verified |
+
+## 🛡️ Native PS5 exit fix (v1.0.28)
+
+Closing with **○**, then **×** now exits through `sceSystemServiceLoadExec("exit", nullptr)` after native graphics/audio/HTTP/controller teardown. This replaces libc `exit()` that could cause SIGSYS (signal 12); the CRT main-return path is protected too. All existing saves and ROM folders remain untouched.
 
 ## 🎮 Controller guide
 
@@ -78,7 +82,7 @@ The repository contains the native app's NES/FCEUmm sources, PS5 adapter, Porpoi
 - **Build script:** `nes/tools/build.sh`
 - **Release version authority:** `app.json`
 
-The GitHub Actions build restores pinned PS5 Vulkan/SDK dependencies, prepares shader and UI assets, compiles the native ELF, packages `PPSA99204.zip`, and uploads a versioned GitHub Release. It requires a suitable native PS5 SDK/toolchain; ordinary desktop compilation does **not** produce a PS5-installable application. New changes to native source on `main` automatically trigger the workflow. Releases use compatibility tags such as `ps5nesx-v1.0.27`.
+The GitHub Actions build restores pinned PS5 Vulkan/SDK dependencies, prepares shader and UI assets, compiles the native ELF, packages `PPSA99204.zip`, and uploads a versioned GitHub Release. It requires a suitable native PS5 SDK/toolchain; ordinary desktop compilation does **not** produce a PS5-installable application. New changes to native source on `main` automatically trigger the workflow. Releases use compatibility tags such as `ps5nesx-v1.0.28`.
 
 ## 🧾 Credits, rights and contributions
 

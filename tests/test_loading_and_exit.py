@@ -20,7 +20,9 @@ assert 'else if (in.cross && !m_prev.cross)' in app
 assert 'm_exit_requested = true;' in app
 assert 'Close NESYX?' in app and 'Do you want to close NESYX?' in app
 assert 'icon::Cross' in app and 'icon::Circle' in app
-assert 'if (app.ExitRequested())' in platform and '::exit(0);' in platform
+assert 'if (app.ExitRequested())' in platform
+assert 'nesyx_exit_to_shell("CoverFlow exit confirmed")' in platform
+assert '::exit(0);' not in platform
 assert 'if (nes_game.Active())' in platform
 assert f'kReportHeader[] = "NESYX v{meta["version"]} by YAHBALLON"' in version
 print("PASS: NESYX neon loading, live progress, main-menu confirmation and clean exit")

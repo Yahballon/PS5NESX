@@ -2,9 +2,9 @@
   "name": "NESYX",
   "slug": "ps5nesx",
   "titleId": "PPSA99204",
-  "version": "1.0.27",
+  "version": "1.0.28",
   "upstreamVersion": "1.0.0.9",
-  "releaseTag": "ps5nesx-v1.0.27",
+  "releaseTag": "ps5nesx-v1.0.28",
   "sourceRepository": "Yahballon/PS5NESX",
   "sourceScope": [
     "nes",
