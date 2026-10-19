@@ -204,7 +204,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          root="$GITHUB_WORKSPACE/homebrew/ps5nesx"
+          root="$GITHUB_WORKSPACE"
           deps="$root/deps"
           mkdir -p "$deps"
           ln -s "$GITHUB_WORKSPACE/build/deps/PS5_Vulkan" "$deps/PS5_Vulkan"
