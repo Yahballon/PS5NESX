@@ -1,140 +1,93 @@
-# Building PS5NES
+# Building NESYX for PlayStation 5
 
-(AI-assisted) The app is built under Linux or WSL with an out-of-tree object directory. The release was produced with a prepared public PS5 dependency environment; a completely fresh-machine dependency bootstrap has not been validated.
+**NESYX v1.0.27** · **by YAHBALLON** · **Title ID `PPSA99204`**
 
-## Tools
+This repository contains the actual native FCEUmm + Vulkan/Porpoise frontend used in the installed homebrew app. It is a PS5 application, not a PC executable. GitHub Actions builds, validates and publishes `PPSA99204.zip` from the checked-in source.
 
-Install Clang/LLD 18, CMake, Ninja, Make, Python 3, Git and the development tools required by the dependency projects.
+## Recommended: GitHub Actions
 
-The root PCSX2 CMake/Visual Studio projects belong to the inherited scaffold. For PS5NES, use **nes/tools/build.sh**.
+The supported build path is **[NESYX Native Build & Release](.github/workflows/build-nesyx.yml)**.
 
-## Tested source revisions
+1. Push your code to `main` or start the workflow via **Actions → NESYX Native Build & Release → Run workflow**.
+2. The job checks `app.json` (single version authority), runs all CoverFlow/asset/controller/display regression tests, installs PS5 toolchain dependencies, and compiles the PS5 executable.
+3. It validates the signed `eboot.bin`, PS5 metadata and files inside `PPSA99204.zip`.
+4. A successful main-branch build uploads a workflow artifact and creates a tagged [GitHub Release](https://github.com/Yahballon/PS5NESX/releases).
 
-| Component | Revision / release |
-| --- | --- |
-| FCEUmm | 7a542dab1e87679921962a9f056186eca425c0c2 |
-| PS5_Vulkan | f3cbf875f89978deae9f855b9be2610cec2818ae |
-| PS5 payload SDK | upstream v0.42 with fork 95c08f27386fc698f6bbe21dde3030140a41d10b |
-| OpenGL-derived shader compiler toolchain | 6cb291abea32281571c49705735046425cf000fd |
-| Libnfs | libnfs-5.0.3 |
-| PacBrew static libraries | v0.40.2 |
-| Restricted Lapy helper | 54a095c0f19161825e845daa760a03b446e654fa |
+Release tags retain the compatibility prefix `ps5nesx-v<version>` while the app is called NESYX. **Never re-use an existing release tag**: increase `version` and `releaseTag` together in `app.json` first. Do not modify `PPSA99204` or the existing `/data/PS5NES` data directory.
 
-FCEUmm source is included. Its revision is recorded in nes/third_party/fceumm/UPSTREAM_REVISION.txt, so extracting the source ZIP does not require its .git directory.
+The first native build for this repository can take a while because it creates the Vulkan compiler SDK and shader archives. Later builds may restore the repository's CI cache.
 
-## Dependency layout
+## Native build prerequisites
 
-Prepare a dependency directory with this layout:
+For an advanced local build use Ubuntu 24.04 or compatible Linux/WSL with Clang/LLD 18, LLVM 18, CMake, Ninja, Make, glslangValidator, Meson, Python 3, a working C/C++ toolchain and network access to the pinned open-source dependencies.
 
-~~~text
-deps/
-├── PS5_Vulkan/
-│   ├── build/driver/ps5/libps5vk.ps5.a
-│   ├── build/driver/ps5/libpsbc_driver.ps5.a
-│   ├── .deps/native/vulkan-runtime/lib/libvk_runtime.ps5.a
-│   ├── .deps/native/psbc/lib/libpsbc_support.ps5.a
-│   ├── .deps/native/ps5-payload-sdk/
-│   └── runtime/libc.prx
-├── libnfs/
-├── libnfs-install/
-│   ├── include/nfsc/
-│   └── lib/libnfs.a
-└── filesystem-helper/
-    ├── tools/build-lapy-helper.py
-    └── .deps/pacbrew/v0.40.2/sysroot/user/homebrew/
-        ├── include/
-        └── lib/
-            ├── libcurl.a
-            ├── libpsl.a
-            ├── libssl.a
-            ├── libcrypto.a
-            ├── libzstd.a
-            └── libz.a
-~~~
+The CI configuration is the reproducible reference:
 
-Use the pinned public [PS5_Vulkan](https://github.com/mihawk-99/PS5_Vulkan) source and its documented SDK, compiler/runtime and driver build scripts. Its SDK setup expects the [PS5_PayloadSDK fork](https://github.com/mihawk-99/PS5_PayloadSDK) source or an explicit fork path. Keep the driver's dependency source available: the app builds its three required Mesa utility objects from that tree.
+- `scripts/bootstrap_native.sh` — prepares PS5_Vulkan, the payload SDK, PS5 shader compiler sources and signed runtime imports.
+- `scripts/build_generated_psbc.py` — compiles generated NIR/SPIR-V/ACO objects missing in a cold compiler build.
+- `scripts/build_agc_imports.py` — creates **link-time** AGC import stubs (not packaged as substitute runtime libraries).
+- `ps5/tools/build-libnfs.sh` — builds pinned libnfs for the console toolchain.
+- `nes/tools/build.sh` → `nes/tools/build_shelf.py` — builds the FCEUmm core, PS5 application ELF, signs and packages it.
 
-Build libnfs with the PS5 SDK toolchain:
+Never distribute the third-party toolchain caches, locally built proprietary content, or copyrighted ROMs.
 
-~~~bash
-git clone --branch libnfs-5.0.3 https://github.com/sahlberg/libnfs.git deps/libnfs
-bash ps5/tools/build-libnfs.sh \
-  deps/libnfs deps/libnfs-output \
-  deps/PS5_Vulkan/.deps/native/ps5-payload-sdk/toolchain/prospero.cmake
-~~~
+### Set up SDK archives
 
-That script prints LIBNFS_PREFIX. You can use its install directory directly instead of renaming it to libnfs-install.
+The workflow performs these commands after apt package installation:
 
-Use [ps5-native-app-boilerplate](https://github.com/blackbearreloaded/ps5-native-app-boilerplate) as filesystem-helper. Its PacBrew setup script can resolve the static HTTPS dependency set:
+```bash
+bash scripts/bootstrap_native.sh
 
-~~~bash
-bash deps/filesystem-helper/tools/setup-pacbrew-dependencies.sh --resolve libcurl
-~~~
+export PS5_VULKAN_DIR="$PWD/build/deps/PS5_Vulkan"
+export PS5_PAYLOAD_SDK="$PS5_VULKAN_DIR/.deps/native/ps5-payload-sdk"
 
-The helper builder fetches and verifies its own pinned public inputs. No Sony proprietary SDK is bundled.
+python3 scripts/build_generated_psbc.py
+python3 scripts/build_agc_imports.py
+```
 
-## Build
+Build the native network libraries and PacBrew static dependencies using the exact commands in [the workflow](.github/workflows/build-nesyx.yml), then export:
 
-~~~bash
+```bash
 export PS5NES_DEPS="$PWD/deps"
 export PS5_PAYLOAD_SDK="$PS5NES_DEPS/PS5_Vulkan/.deps/native/ps5-payload-sdk"
 export LIBNFS_PREFIX="$PS5NES_DEPS/libnfs-output/install"
 export LIBZ_PREFIX="$PS5NES_DEPS/filesystem-helper/.deps/pacbrew/v0.40.2/sysroot/user/homebrew"
+export PS5NES_PSBC_GENERATED="$PWD/build/ps5-core/generated-psbc.ps5.a"
+export PS5NES_AGC_STUB_DIR="$PWD/build/ps5-core/agc-imports"
+
 bash nes/tools/build.sh
-~~~
+```
 
-LIBZ_PREFIX is the prefix for the complete static curl/SSL/compression library set, not just zlib.
+`deps/PS5_Vulkan` is a symlink to `build/deps/PS5_Vulkan` created by the workflow. The builder also requires the **verified, previously signed `PPSA99204/lapy.elf` helper** from the source project's `ps5nesx-v1.0.11` archive. The CI workflow downloads and SHA-256-checks that package; set `PS5NES_LAPY_BASELINE` to the corresponding ZIP if building manually. The helper's source is no longer publicly available, so builds must not fabricate its replacement.
 
-If you already have compatible Mesa utility objects, PS5NES_MESA_UTIL_DIR can point to the directory containing u_thread.o, anon_file.o and os_file.o. Otherwise they are built into nes/build-shelf/mesa-util/.
+### Build output
 
-Outputs:
+```text
+nes/build-shelf/NESYX-v1.0.27-by-YAHBALLON.zip
+dist/PPSA99204.zip                  # validated CI release copy
+```
 
-~~~text
-nes/build-shelf/package/PPSA99204/
-nes/build-shelf/PS5NES-v1.0.0.9-Internal-ROM-Detection-by-YAHBALLON.zip
-~~~
+The installed package contains a real signed `PPSA99204/eboot.bin`, a `sce_sys/` directory, `sce_module/libc.prx`, helper files and third-party licenses.
 
-The build compiles the **project's PS5SX2 native writer**. Do not replace it with the driver helper packager: they emit different process-memory parameters. The generated ELF is checked before signing by nes/tools/check_memory.py.
+## Shader, source and interface layout
 
-## Shaders and assets
+| Path | Responsibility |
+| --- | --- |
+| `app.json` | Display version, release tag, title identifier |
+| `nes/src/core_session.cpp` | FCEUmm and Mesen-style HD pack integration |
+| `nes/src/loading.cpp` | Animated Pixel Reactor startup screen |
+| `nes/src/shelf_runtime.cpp` | Emulation session and 16:9/4:3/integer viewport |
+| `ps5/frontend/fe_exact_porpoise.cpp` | NESYX CoverFlow, glass cases, tiger header, fallback covers |
+| `ps5/frontend/fe_app.cpp` | Settings, menu input and Circle-to-close confirmation |
+| `ps5/frontend/assets/no-cover.png` | Original 1024 × 1536 NO COVER fallback |
+| `ps5/frontend/assets/tiger-logo.png` | Original tiger branding |
+| `ps5/porpoise_original/` | Original Porpoise renderer with PS5-specific integration |
+| `tests/` | Regression suite executed by native CI |
 
-The checked-in fe_shaders.inc matches the shipped GLSL. After changing shaders, use a host glslang executable:
+Rebuild modified shaders with `bash ps5/frontend/build_shaders.sh` and `python3 ps5/porpoise_original/tools/rebuild_shader.py`. The Porpoise source and legal notices are included; required runtime fonts/sounds are verified against pinned upstream hashes during CI.
 
-~~~bash
-GLSLANG_VALIDATOR=/path/to/glslangValidator bash ps5/frontend/build_shaders.sh
-~~~
+## Source provenance and licensing
 
-The launcher icon must be a 512×512 PNG at nes/sce_sys/icon0.png. The supplied original logo is retained in nes/assets/logo-original.png.
+This standalone repository was synchronized from the **PS5-hardware-tested NESYX v1.0.27** files in `Yahballon/tmp_lap/homebrew/ps5nesx`; future changes can be made directly here. The one-time import helper is `[Import NESYX Source](.github/workflows/sync-nesyx-source.yml)`. Rerunning it deliberately reapplies its pinned source snapshot and can overwrite native source edits, so do not use it to build future releases.
 
-## Verification
-
-Useful checks include:
-
-- nes/tools/check_memory.py — inspect the actual native ELF memory parameters.
-- nes/tools/test.py — ROM/ZIP/input/audio/save-state/SRAM/PAL tests using a generated, original test ROM.
-- ps5/frontend/host/test-nfs.py — NFS transport and failure tests.
-- nes/tools/test_controller_bindings.cpp — input/chord and settings persistence checks.
-- nes/tools/test_cover_window.cpp — bounded artwork streaming with a large library.
-
-Some standalone test sources require compilation with their associated frontend sources; they are not all exposed through a single test runner. Host verification does not replace PS5 hardware testing.
-
-Generated build folders, external dependency caches, local logs and Git internals are omitted from the release source archive.
-
-## Preparing a GitHub source release (AI-assisted)
-
-Review the diff, then refresh and verify the source inventory:
-
-~~~bash
-python3 tools/prepare_source.py --write
-python3 tools/prepare_source.py --archive
-~~~
-
-The verified ZIP and SHA-256 checksum are written to `release/`. The ZIP contains
-source and notices, including vendored dependency source, but no Git metadata
-or ignored build output. Source hashes describe checkout bytes; line-ending
-conversion can require refreshing the manifest on another machine.
-
-Inherited PCSX2 desktop workflow definitions, funding configuration and support
-links were removed for this PS5NES release. Their build helper sources remain
-available in `.github/workflows/scripts/` for the retained desktop scaffold.
-No automated PS5 build or hardware test is configured.
+No game ROMs, BIOS or copyrighted commercial game files are included. See `LICENSE`, `THIRD_PARTY_NOTICES.md` and the upstream libraries' own licenses.
