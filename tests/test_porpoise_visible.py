@@ -6,7 +6,7 @@ ps5=(root/'ps5/frontend/fe_ps5.cpp').read_text()
 app=(root/'ps5/frontend/fe_app.cpp').read_text()
 bridge=(root/'ps5/frontend/fe_exact_porpoise.cpp').read_text()
 gfx=(root/'ps5/porpoise_original/src/ui_gfx.cpp').read_text()
-workflow=(root.parent.parent/'.github/workflows/build-ps5nesx.yml').read_text()
+workflow=(root/'.github/workflows/build-nesyx.yml').read_text()
 checks={
     'embedded fonts': 'FE_INCBIN_ASSET(fe_pp_nunito_regular' in ps5,
     'writable font mount': 'original_ui.asset_dir=paths.top_dir+"/porpoise-ui"' in ps5,

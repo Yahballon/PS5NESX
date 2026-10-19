@@ -4,7 +4,7 @@ from pathlib import Path
 root=Path(__file__).resolve().parents[1]
 gfx=(root/'ps5/porpoise_original/src/ui_gfx.cpp').read_text()
 shader=(root/'ps5/porpoise_original/shaders/ui.frag').read_text()
-workflow=(root.parent.parent/'.github/workflows/build-ps5nesx.yml').read_text()
+workflow=(root/'.github/workflows/build-nesyx.yml').read_text()
 ps5=(root/'ps5/frontend/fe_ps5.cpp').read_text()
 assert gfx.count('fill(v[n].p2, {g->u0, g->v0, g->u1, g->v1});')==2, 'ordinary and mapped SDF text UV'
 assert 'fill(v[i].p2, {uv[0], uv[1], uv[2], uv[3]});' in gfx, 'cropped image UV'
