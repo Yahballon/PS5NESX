@@ -274,9 +274,21 @@ const std::vector<OptionGroup>& OptionGroups()
 {
     // (AI-assisted) NES values in the unchanged original options-sheet layout.
     static const std::vector<OptionGroup> groups = {
+        {"Appearance", {Seg("PS5NESX/Theme", "Theme", "porpoise", "",
+            {{"porpoise","Porpoise"},{"oled","OLED"},{"cube","Cube"},
+             {"aurora","Aurora"},{"synthwave","Synthwave"}},
+            "Changes the entire Porpoise menu theme immediately. Saved globally for every NES game.")},
+            kTabSettings},
         {"Emulation", {Seg("NES/Region", "Region", "Auto", "", {{"Auto","Automatic"},{"NTSC","NTSC"},{"PAL","PAL"},{"Dendy","Dendy"}}),
-                       Seg("NES/Palette", "Palette", "default", "", {{"default","Default"},{"rgb","RGB"},{"nintendo-vc","Nintendo VC"}})}, kTabSettings},
-        {"Display", {Seg("NES/Aspect", "Picture", "4:3", "", {{"4:3","4:3"},{"Integer","Integer pixels"}})}, kTabSettings},
+                       Seg("NES/Palette", "Palette", "default", "", {{"default","Default"},{"rgb","RGB"},{"nintendo-vc","Nintendo VC"}}),
+                       Toggle("NES/HDPacks", "HD texture packs", "false", "",
+                           "Load a Mesen hires.txt pack from /data/PS5NES/HdPacks/<ROM name>/ on game launch (experimental).",
+                           true)}, kTabSettings},
+        {"Display", {Seg("NES/Aspect", "Picture", "16:9", "",
+            {{"16:9","16:9 Fullscreen"},{"4:3","4:3 Original"},{"Integer","Integer pixels"}},
+            "Fullscreen fills the entire screen without side borders, stretching NES pixels horizontally. "
+            "4:3 retains the classic picture and Integer preserves whole-pixel scaling. "
+            "Changes apply when launching the game.")}, kTabSettings},
         {"Audio", {Toggle("NES/Sound", "Game sound", "true", "")}, kTabSettings},
         {"NES buttons", NesButtonRows(), kTabControls},
         {"Save state", NesShortcutRows(0), kTabControls},
@@ -394,6 +406,15 @@ void OptionsSheet::BuildRows()
 
 OptionsSheet::Effective OptionsSheet::Get(const std::string& key, const std::string& def) const
 {
+    // Menu theme is a console-wide choice even when Settings was opened
+    // from an individual game. Never allow per-ROM overrides.
+    if(key == "PS5NESX/Theme")
+    {
+        const IniState& global = m_global ? m_own : m_globals;
+        if(const std::string* value=Find(global,key))
+            return {*value, m_global ? From::Own : From::Global};
+        return {def, From::Default};
+    }
 	if (const std::string* v = Find(m_own, key))
 		return {*v, From::Own};
 	if (!m_global)
@@ -583,19 +604,23 @@ std::string OptionsSheet::Help(const Row& r) const
 
 bool OptionsSheet::Save(const std::vector<Change>& changes, const std::string& note)
 {
+    const bool theme_only = changes.size()==1 && changes.front().key=="PS5NESX/Theme";
+    const std::string& destination=theme_only ? m_paths.gs_ini : m_path;
+    const std::string header=theme_only ? "# All games - NESYX interface theme" :
+        (m_global ? m_header : m_header + ": written from the PS5SX2 shelf");
 	std::string what, error;
-	if (!EditSettingsFile(m_path, m_global ? m_header : m_header + ": written from the PS5SX2 shelf", changes, what, error))
+	if (!EditSettingsFile(destination, header, changes, what, error))
 	{
 		m_status = "Couldn't save: " + error;
-		std::printf("[options] %s: %s\n", m_file_label.c_str(), m_status.c_str());
+		std::printf("[options] %s: %s\n", destination.c_str(), m_status.c_str());
 		Reload();
 		return false;
 	}
 	m_saved++;
 	m_status = "Saved";
-	std::printf("[options] %s: %s\n", m_file_label.c_str(), what.empty() ? "no change" : what.c_str());
+	std::printf("[options] %s: %s\n", destination.c_str(), what.empty() ? "no change" : what.c_str());
 	if (m_paths.log)
-		m_paths.log("shelf: " + m_file_label + ": " + (note.empty() ? std::string() : note + ": ") + (what.empty() ? std::string("no change") : what));
+		m_paths.log("shelf: " + destination + ": " + (note.empty() ? std::string() : note + ": ") + (what.empty() ? std::string("no change") : what));
 	Reload();
 	return true;
 }
@@ -678,7 +703,10 @@ bool OptionsSheet::Reset(const Row& r)
 	switch (r.kind)
 	{
 		case Kind::Option:
-			if (Get(r.def->key, r.def->def).from != From::Own)
+            // A theme comes from gs.ini even in a game's sheet.
+			if (Get(r.def->key, r.def->def).from != From::Own &&
+                !(r.def->key=="PS5NESX/Theme" &&
+                  Get(r.def->key,r.def->def).from==From::Global))
 				return false;
 			return Save({{Change::Unset, r.def->key, {}}});
 		case Kind::Card:
@@ -707,7 +735,7 @@ bool OptionsSheet::Activate(const Row& r, double now)
 {
     if(r.kind==Kind::RescanLibrary){
         std::string error;bool okay=m_paths.rescan_library&&m_paths.rescan_library(error);
-        m_status=okay?"Rescan requested. Restart PS5NES.":error;
+        m_status=okay?"Rescan requested. Restart NESYX.":error;
         return okay;
     }
 	const int index = static_cast<int>(&r - m_rows.data());

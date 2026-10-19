@@ -106,6 +106,22 @@ std::string UsbDriveRoot(const std::string& path);
 // another shape.
 std::string OplGameId(const std::string& serial);
 
+// Thread-safe snapshot for a small, non-blocking status strip in the
+// original Porpoise glass UI (progress counts ROMs, not network bytes).
+struct CoverProgress
+{
+    int games = 0;
+    int scanned = 0;
+    int planned = 0;
+    int attempted = 0;
+    int downloaded = 0;
+    int failed = 0;
+    bool transferring = false;
+    bool offline = false;
+    bool done = false;
+    std::string current;
+};
+
 class CoverService
 {
 public:
@@ -128,6 +144,7 @@ public:
 
 	// A line for the UI: "" when idle, else e.g. "Downloading covers  3 / 11".
 	std::string Status() const;
+	CoverProgress Progress() const; // copy made under m_mutex
 
 	// Paints a placeholder front / a spine (also used before the worker runs).
 	static void PaintSpine(const Fonts& fonts, const GameInfo& g, CoverImage& out);
@@ -174,5 +191,6 @@ private:
 	bool m_offline = false;
 	bool m_busy = false;
 	std::string m_download_status;
+	CoverProgress m_progress;
 };
 } // namespace fe

@@ -17,6 +17,8 @@ layout(push_constant) uniform Push
 	vec4 misc;        // x = aspect (w/h), y = horizon (0..1), z = vignette, w = time
 } pc;
 
+// The selected cover comes from the same descriptor as the 3D case.
+layout(set = 1, binding = 0) uniform sampler2D u_spotlight_cover;
 layout(location = 0) in vec2 v_uv;
 layout(location = 0) out vec4 o_color;
 
@@ -27,6 +29,22 @@ void main()
 	float h = pc.misc.y;
 	vec3 col = uv.y < h ? mix(pc.col_top.rgb, pc.col_mid.rgb, smoothstep(0.0, h, uv.y))
 	                    : mix(pc.col_mid.rgb, pc.col_bottom.rgb, smoothstep(h, 1.0, uv.y));
+
+	// Porpoise-inspired selected-cover spotlight. The portrait artwork is
+	// zoomed-to-fill a widescreen crop, softened and heavily dimmed so it
+	// stays behind readable cases and HUD labels. Only five filtered taps.
+	if (pc.floor_glow.w > 0.001)
+	{
+		vec2 p = vec2(uv.x, 0.5 + (uv.y - 0.5) * 0.34);
+		vec2 blur = vec2(0.028, 0.009);
+		vec3 cover = texture(u_spotlight_cover, p).rgb * 0.32;
+		cover += texture(u_spotlight_cover, p + blur).rgb * 0.17;
+		cover += texture(u_spotlight_cover, p - blur).rgb * 0.17;
+		cover += texture(u_spotlight_cover, p + vec2(-blur.x, blur.y)).rgb * 0.17;
+		cover += texture(u_spotlight_cover, p + vec2(blur.x, -blur.y)).rgb * 0.17;
+		vec3 muted = mix(cover, vec3(dot(cover, vec3(0.25, 0.60, 0.15))), 0.43);
+		col = mix(col, muted * 0.58, pc.floor_glow.w);
+	}
 
 	// The glow behind the selection: an ellipse in height units, with a soft core and a wide skirt.
 	vec2 d = (uv - pc.glow_pos.xy) * vec2(pc.misc.x, 1.0);

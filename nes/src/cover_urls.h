@@ -752,6 +752,13 @@ inline constexpr CoverEntry cover_index[]={
 {"zombienation","U","Zombie%20Nation%20%28USA%29.png",1},
 };
 inline std::string CoverKey(std::string s){
+ // Indexed NES collections often use "022 Rockman 1", "043 Tekken 2"
+ // etc. The artwork index is keyed by the actual game name without its
+ // three-digit collection prefix. Do not strip title numerals elsewhere.
+ if(s.size()>4 && s[0]>='0'&&s[0]<='9' &&
+    s[1]>='0'&&s[1]<='9' && s[2]>='0'&&s[2]<='9' &&
+    (s[3]==' '||s[3]=='_'||s[3]=='-'))
+     s.erase(0,4);
  // (AI-assisted) Common ROM title accents differ from the repository's ASCII names.
  const std::pair<const char*,const char*> folds[]={{"é","e"},{"É","e"},{"è","e"},{"ê","e"},{"ë","e"},{"ö","o"},{"Ö","o"},{"ó","o"},{"ô","o"},{"ä","a"},{"Ä","a"},{"à","a"},{"á","a"},{"â","a"},{"ü","u"},{"Ü","u"},{"ú","u"},{"ù","u"},{"î","i"},{"ï","i"},{"í","i"},{"ñ","n"},{"ç","c"}};
  for(const auto& fold:folds){size_t at=0;while((at=s.find(fold.first,at))!=s.npos){s.replace(at,std::char_traits<char>::length(fold.first),fold.second);++at;}}
@@ -775,7 +782,29 @@ inline std::vector<std::string> CoverUrls(const fe::GameInfo& game){
   else rank=code=="U"?80:code=="E"?70:code=="UK"?60:0;
   rank-=item.variants*2;if(rank>score){score=rank;best=&item;}}
  if(best)urls.emplace_back(std::string("https://raw.githubusercontent.com/Globaleliteee/Gaming_Console_Covers_Art_Repository/main/covers/nintendo/NES/")+best->filename);
- auto add=[&](const std::string& name){auto url=std::string("https://raw.githubusercontent.com/libretro-thumbnails/Nintendo_-_Nintendo_Entertainment_System/master/Named_Boxarts/")+CoverEncode(name)+".png";if(std::find(urls.begin(),urls.end(),url)==urls.end())urls.push_back(std::move(url));};
- add(game.stem);if(!region.empty())add(title+" ("+region+")");else add(title);return urls;
+ // Fallback: Libretro's public NES Named_Boxarts archive. The original
+ // ROM stem may include a numbered list prefix, so also try a clean title.
+ auto add=[&](const std::string& name){
+  if(name.empty())return;
+  const auto filename=CoverEncode(name)+".png";
+  // User-confirmed official Libretro thumbnails directory, with raw GitHub
+  // mirror as fallback. Both are JPEG/PNG validated before entering cache.
+  for(const char* base : {
+    "https://thumbnails.libretro.com/Nintendo%20-%20Nintendo%20Entertainment%20System/Named_Boxarts/",
+    "https://raw.githubusercontent.com/libretro-thumbnails/Nintendo_-_Nintendo_Entertainment_System/master/Named_Boxarts/"
+  }) {
+    const auto url=std::string(base)+filename;
+    if(std::find(urls.begin(),urls.end(),url)==urls.end())urls.push_back(url);
+  }
+ };
+ auto clean=title;
+ if(clean.size()>4 && clean[0]>='0'&&clean[0]<='9' &&
+    clean[1]>='0'&&clean[1]<='9' && clean[2]>='0'&&clean[2]<='9' &&
+    (clean[3]==' '||clean[3]=='_'||clean[3]=='-')) clean.erase(0,4);
+ add(game.stem);
+ if(!region.empty())add(clean+" ("+region+")");
+ else add(clean+" (USA)");
+ add(clean);
+ return urls;
 }
 }

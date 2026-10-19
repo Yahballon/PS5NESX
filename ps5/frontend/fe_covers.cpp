@@ -5,6 +5,8 @@
 
 #include "fe_covers.h"
 #include "cover_urls.h"
+#include "fe_arcadeartwork.h"
+#include "fe_libretro_catalog.h"
 #ifdef ORBIS_VULKAN
 #include "fe_file_io.h"
 #endif
@@ -110,8 +112,8 @@ bool IsCoverFile(const std::string& path)
 bool RecentlyMissing(const std::string& cache_dir, const std::string& serial)
 {
 	struct stat st = {};
-	return stat((cache_dir + "/" + serial + ".nescovers-v8.missing").c_str(), &st) == 0 &&
-		   std::time(nullptr) - st.st_mtime < 14 * 24 * 3600;
+	return stat((cache_dir + "/" + serial + ".nescovers-v10.missing").c_str(), &st) == 0 &&
+		   std::time(nullptr) - st.st_mtime < 2 * 24 * 3600;
 }
 
 // The glow colour: the dominant saturated hue of the cover, brightened.
@@ -471,8 +473,26 @@ void CoverService::PaintSpine(const Fonts& fonts, const GameInfo& g, CoverImage&
 	}
 }
 
+// The same bundled placeholder is shared by all games; real artwork always
+// replaces it when found locally or downloaded successfully.
+extern "C" const uint8_t fe_nocover_png[], fe_nocover_png_end[];
 void CoverService::PaintPlaceholder(const Fonts& fonts, const GameInfo& g, CoverImage& out)
 {
+    static const CoverImage embedded = [] {
+        CoverImage result;
+        const std::vector<uint8_t> png(fe_nocover_png, fe_nocover_png_end);
+        // Keep the older Vulkan shelf's bounded texture cache affordable; the
+        // active Porpoise coverflow uses the full 1536px source instead.
+        if (CoverService::Decode(png, 768, result))
+            result.kind = CoverImage::Placeholder;
+        return result;
+    }();
+    if (!embedded.rgba.empty()) {
+        out = embedded;
+        out.kind = CoverImage::Placeholder;
+        return;
+    }
+    // Keep the old title-card renderer if the bundled PNG cannot be decoded.
 	const int W = 364, H = 512;
 	Fill(out, W, H);
 	out.kind = CoverImage::Placeholder;
@@ -527,6 +547,10 @@ void CoverService::Start(const std::vector<GameInfo>& games, const Fonts* fonts,
 	m_fonts = fonts;
 	m_cfg = cfg;
 	m_download = std::move(download);
+	{ std::lock_guard<std::mutex> lock(m_mutex);
+	  m_progress = CoverProgress();
+	  m_progress.games = static_cast<int>(games.size());
+	}
 	m_stop = false;
 	m_finished = false;
 	if (!m_cfg.cache_dir.empty())
@@ -584,6 +608,12 @@ bool CoverService::Poll(CoverImage& out)
 void CoverService::SetSelected(int selected)
 {
 	m_selected = selected;
+}
+
+CoverProgress CoverService::Progress() const
+{
+    std::lock_guard<std::mutex> lock(m_mutex);
+    return m_progress;
 }
 
 std::string CoverService::Status() const
@@ -645,6 +675,15 @@ static int FetchCover(const GameInfo& game,const CoverConfig& cfg,const Download
                       std::vector<uint8_t>& bytes,CoverImage& image,std::string& used,
                       const std::atomic<bool>* stop=nullptr){
  auto urls=cfg.resolve_urls?cfg.resolve_urls(game):std::vector<std::string>{cfg.url_template};
+ // Resolve filenames against the ACTUAL Libretro directory listing once
+ // per cover-worker session. Handles numbered ROM sets and nonstandard
+ // regional or revision names without issuing hundreds of blind 404s.
+ if(!(stop&&*stop))
+ {
+  const std::string official=libretro::Lookup(game,download,stop);
+  if(!official.empty() && std::find(urls.begin(),urls.end(),official)==urls.end())
+   urls.insert(urls.begin(),official);
+ }
  int status=404,other_error=0;
  for(auto url:urls){if(stop&&*stop)break;auto at=url.find("${serial}");if(at!=url.npos)url.replace(at,9,game.serial);
   at=url.find("${title}");if(at!=url.npos)url.replace(at,8,nes::CoverEncode(game.stem));
@@ -653,6 +692,28 @@ static int FetchCover(const GameInfo& game,const CoverConfig& cfg,const Download
   if(status==200&&CoverService::Decode(bytes,1024,image)){std::printf("[covers] matched %s -> %s\n",game.file.c_str(),url.c_str());return 200;}
   std::printf("[covers] candidate %s -> HTTP %d%s\n",url.c_str(),status,status==200?" (invalid image)":"");
   if(status<0)return status;if(status!=404)other_error=status;
+ }
+ // Optional Piwigo NES/Famicom Box Art category #547 fallback.
+ // Image URLs come from the category JSON catalogue, NEVER from guessed
+ // paths or HTML search pages. Catalogue fetch is one-time per worker.
+ if(!(stop&&*stop))
+ {
+  const std::string alternate=arcadeartwork::Lookup(game,download,stop);
+  if(!alternate.empty())
+  {
+   used=alternate;bytes.clear();
+   status=download(alternate,bytes);
+   if(status==200 && CoverService::Decode(bytes,1024,image))
+   {
+    std::printf("[covers] ArcadeArtwork matched %s -> %s\n",
+                game.file.c_str(),alternate.c_str());
+    return 200;
+   }
+   std::printf("[covers] ArcadeArtwork alternate HTTP %d for %s\n",
+               status,game.file.c_str());
+   if(status<0)return status;
+   if(status!=404)other_error=status;
+  }
  }
  return other_error?other_error:status;
 }
@@ -663,12 +724,15 @@ bool CoverService::DownloadCover(int index, CoverImage& out)
 	if (m_offline || m_stop)
 		return false;
 	const std::string cached = m_cfg.cache_dir + "/" + g.serial + ".jpg";
-	const std::string missing = m_cfg.cache_dir + "/" + g.serial + ".nescovers-v8.missing";
+	const std::string missing = m_cfg.cache_dir + "/" + g.serial + ".nescovers-v10.missing";
 	std::vector<uint8_t> bytes;
 	std::string url;
 	{
 		std::lock_guard<std::mutex> lock(m_mutex);
 		m_busy = true;
+		m_progress.transferring = true;
+		m_progress.current = g.title;
+		m_progress.done = false;
 	}
 	int status=FetchCover(g,m_cfg,m_download,bytes,out,url,&m_stop);
 	bool ok = false;
@@ -693,6 +757,13 @@ bool CoverService::DownloadCover(int index, CoverImage& out)
 	{
 		std::lock_guard<std::mutex> lock(m_mutex);
 		m_download_done++;
+		++m_progress.attempted;
+		if (saved) ++m_progress.downloaded;
+		if (!ok) ++m_progress.failed;
+		m_progress.offline = m_offline;
+		m_progress.transferring = false;
+		m_progress.done = m_offline || m_progress.attempted >= m_progress.planned;
+		m_busy = false;
 		if (ok)
 			m_download_status = saved ? "Covers: " + std::to_string(m_download_done) + "/" + std::to_string(m_download_total) + " processed" : "Cover shown; cache save failed";
 		else if (!m_stop)
@@ -750,7 +821,7 @@ int CoverService::Prefetch(const std::vector<GameInfo>& games, const std::vector
 		if (status == 200 && !probe.rgba.empty())
 			ok = WriteFileAtomic(cfg.cache_dir + "/" + g.serial + ".jpg", bytes);
 		else if (status == 404)
-			WriteFileAtomic(cfg.cache_dir + "/" + g.serial + ".nescovers-v8.missing", std::vector<uint8_t>{'4', '0', '4', '\n'});
+			WriteFileAtomic(cfg.cache_dir + "/" + g.serial + ".nescovers-v10.missing", std::vector<uint8_t>{'4', '0', '4', '\n'});
 		std::printf("[frontend] prefetch %s: %d%s\n", g.serial.c_str(), status,
 			ok ? " (saved)" : (status == 200 ? " (not an image; not kept)" : ""));
 		std::fflush(stdout);
@@ -774,6 +845,25 @@ void CoverService::RunWindow()
     const int n=static_cast<int>(m_games.size());
     std::vector<bool> painted(n,false),local(n,false),want(n,false),attempted(n,false);
     CoverFinder finder(m_cfg.manual_dir,m_cfg.cache_dir);
+    // Check all game paths once on the worker thread. Background downloads
+    // continue beyond the 12 live cover slots, but they only write the
+    // on-disk cache; distant textures are never uploaded to Vulkan.
+    std::vector<bool> pending(n,false);
+    if(m_cfg.allow_download && m_download) {
+        for(int i : MissingCovers(m_games,m_cfg)) pending[i]=true;
+    }
+    int planned=0; for(bool p : pending) if(p) ++planned;
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_progress.games=n;
+        m_progress.scanned=n;
+        m_progress.planned=planned;
+        m_progress.done=planned==0;
+        m_download_total=planned;
+        m_download_done=0;
+    }
+    std::printf("[covers] scan complete: %d games, %d missing, auto-download=%d\n",
+                n,planned,m_cfg.allow_download?1:0);
     auto deliver=[&](CoverImage& image) {
         while(!m_stop) {
             {std::lock_guard<std::mutex> lock(m_mutex);
@@ -786,10 +876,14 @@ void CoverService::RunWindow()
     int previous_selection=-1;
     while(!m_stop) {
         int refresh=-1;
-        {std::lock_guard<std::mutex> lock(m_mutex);if(!m_refresh_requests.empty()){refresh=m_refresh_requests.front();m_refresh_requests.pop_front();m_offline=false;++m_download_total;}}
+        {std::lock_guard<std::mutex> lock(m_mutex);if(!m_refresh_requests.empty()){
+            refresh=m_refresh_requests.front();m_refresh_requests.pop_front();
+            m_offline=false;m_progress.offline=false;m_progress.done=false;
+            ++m_download_total;++m_progress.planned;
+        }}
         if(refresh>=0){
             // (AI-assisted) Bypass cached artwork and old 404 markers, retaining the old image on failure.
-            const auto& game=m_games[refresh];unlink((m_cfg.cache_dir+"/"+game.serial+".nescovers-v8.missing").c_str());
+            const auto& game=m_games[refresh];unlink((m_cfg.cache_dir+"/"+game.serial+".nescovers-v10.missing").c_str());
             CoverImage updated;std::printf("[covers] refresh selected: %s\n",game.title.c_str());
             const bool okay=DownloadCover(refresh,updated);
             if(okay){updated.game=refresh;updated.kind=CoverImage::Cover;if(!deliver(updated))break;finder=CoverFinder(m_cfg.manual_dir,m_cfg.cache_dir);local[refresh]=true;want[refresh]=false;}
@@ -823,14 +917,47 @@ void CoverService::RunWindow()
             }
             if(next>=0) {
                 attempted[next]=true;CoverImage cover;
-                {std::lock_guard<std::mutex> lock(m_mutex);++m_download_total;}
+                pending[next]=false;
                 if(DownloadCover(next,cover)){finder=CoverFinder(m_cfg.manual_dir,m_cfg.cache_dir);cover.game=next;cover.kind=CoverImage::Cover;if(!deliver(cover))break;}
+                continue;
+            }
+        }
+        // Once nearby cases are ready, fetch other games one at a time to
+        // disk. Prioritize the currently selected game, never allocate GPU
+        // textures for covers outside the visible window.
+        if(!m_offline && m_cfg.allow_download) {
+            int background=-1,best_dist=n+1;
+            for(int i=0;i<n;++i) {
+                if(!pending[i] || attempted[i]) continue;
+                const int dist=std::abs(i-selected);
+                if(dist<best_dist){best_dist=dist;background=i;}
+            }
+            if(background>=0) {
+                attempted[background]=true;
+                pending[background]=false;
+                if(MayDownload(background)) {
+                    CoverImage image;
+                    const bool ok=DownloadCover(background,image);
+                    if(ok && std::abs(background-selected)<=radius) {
+                        image.game=background;image.kind=CoverImage::Cover;
+                        if(!deliver(image)) break;
+                        finder=CoverFinder(m_cfg.manual_dir,m_cfg.cache_dir);
+                    }
+                } else {
+                    std::lock_guard<std::mutex> lock(m_mutex);
+                    ++m_progress.attempted;
+                    ++m_download_done;
+                    m_progress.done=m_progress.attempted>=m_progress.planned;
+                }
                 continue;
             }
         }
         usleep(10000);
     }
-    std::lock_guard<std::mutex> lock(m_mutex);m_busy=false;
+    std::lock_guard<std::mutex> lock(m_mutex);
+    m_busy=false;
+    m_progress.transferring=false;
+    m_progress.done=true;
 }
 
 void CoverService::Run()

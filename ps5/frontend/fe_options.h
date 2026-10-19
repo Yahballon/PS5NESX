@@ -105,6 +105,7 @@ public:
 	const std::string& title() const { return m_title; }
 	const std::string& file_label() const { return m_file_label; } // "settings/<image>.ini", "gs.ini"
 	const std::vector<Row>& rows() const { return m_rows; }
+    std::string ThemeValue() const { return Get("PS5NESX/Theme", "porpoise").value; }
 
 	// The value the row shows ("4x", "On", "Mcd001.ps2", ...), where it comes from, and what the row does.
 	std::string Value(const Row& r) const;

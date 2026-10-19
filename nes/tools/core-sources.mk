@@ -2,7 +2,7 @@
 CORE_DIR := src
 STATIC_LINKING := 0
 HAVE_NTSC := 0
-HAVE_HDPACK := 0
+HAVE_HDPACK := 1
 WANT_32BPP := 1
 include Makefile.common
 .PHONY: list

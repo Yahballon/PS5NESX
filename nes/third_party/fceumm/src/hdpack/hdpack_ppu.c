@@ -305,6 +305,14 @@ void HDNes_RecordLine(int line, const uint8_t *xbuf_line, int rendis)
       px->tile.ppu_bg_color = backdrop;
       px->tile.bg_color_index = (uint8_t)((xbuf & 0x40) ? 0 : 1);
       px->tile.bg_color = (uint8_t)(xbuf & 0x3F);
+      /* The NES PPU background-enable left-edge mask is eight pixels
+       * wide. Never carry stale XBuf colours into the HD fallback strip
+       * when a game disables rendering there (common at scroll seams). */
+      if (bg_left_clip && x < 8)
+      {
+         px->tile.bg_color_index = 0;
+         px->tile.bg_color = backdrop;
+      }
 
       /* ---- sprites ---- */
       px->sprite_count = 0;

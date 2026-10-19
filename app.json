@@ -1,0 +1,31 @@
+{
+  "name": "NESYX",
+  "slug": "ps5nesx",
+  "titleId": "PPSA99204",
+  "version": "1.0.27",
+  "upstreamVersion": "1.0.0.9",
+  "releaseTag": "ps5nesx-v1.0.27",
+  "sourceRepository": "Yahballon/PS5NESX",
+  "sourceScope": [
+    "nes",
+    "ps5",
+    "3rdparty/include",
+    "3rdparty/vulkan/include"
+  ],
+  "dataFolder": "/data/PS5NES",
+  "installFolder": "PPSA99204",
+  "core": "FCEUmm",
+  "frontend": "NESYX original Porpoise CoverFlow, built-in 1024x1536 no-cover PNG, NES/FCEUmm and auto-downloaded Libretro boxarts",
+  "supportedRomExtensions": [
+    ".nes",
+    ".unf",
+    ".unif",
+    ".zip"
+  ],
+  "hdPacks": {
+    "enabledByDefault": false,
+    "format": "Mesen hires.txt <= v109",
+    "path": "/data/PS5NES/HdPacks/<ROM filename without extension>/",
+    "status": "experimental - HD scanline seam, HUD cache and frame clear test"
+  }
+}

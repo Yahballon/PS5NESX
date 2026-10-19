@@ -9,6 +9,8 @@
 namespace nes {
 Session* Session::current = nullptr;
 Session::Session(std::string directory) : m_directory(std::move(directory)) {
+    const auto slash = m_directory.find_last_of('/');
+    m_system_directory = slash == std::string::npos ? m_directory : m_directory.substr(0, slash);
     current = this;
     retro_set_environment(Environment);
     retro_set_video_refresh(Video);
@@ -30,6 +32,7 @@ bool Session::Environment(unsigned cmd, void* data) {
     case RETRO_ENVIRONMENT_GET_LOG_INTERFACE:
         static_cast<retro_log_callback*>(data)->log = Log; return true;
     case RETRO_ENVIRONMENT_GET_SYSTEM_DIRECTORY:
+        *static_cast<const char**>(data) = s.m_system_directory.c_str(); return true;
     case RETRO_ENVIRONMENT_GET_SAVE_DIRECTORY:
         *static_cast<const char**>(data) = s.m_directory.c_str(); return true;
     case RETRO_ENVIRONMENT_GET_CORE_OPTIONS_VERSION:
@@ -164,8 +167,23 @@ void Session::Video(const void* data, unsigned w, unsigned h, size_t pitch) {
     if (!data) return;
     auto& s = *current;
     const size_t bytes = s.m_format == RETRO_PIXEL_FORMAT_XRGB8888 ? 4 : 2;
-    if (!w || !h || w > 512 || h > 480 || pitch < w * bytes) { s.error = "Invalid core video frame"; return; }
-    s.width = w; s.height = h; s.pixels.resize(w * h);
+    // Mesen HD Packs can render up to 10x 256x240; enforce a bounded frame.
+    if (!w || !h || w > 2560 || h > 2400 ||
+        static_cast<size_t>(w) * h > 2560u * 2400u ||
+        pitch < static_cast<size_t>(w) * bytes) {
+        s.error = "Invalid or oversized NES/HD video frame"; return;
+    }
+    /* Full-width copy/convert is performed for every row. Track unusual
+     * pitch/geometry changes without flooding the console boot log. */
+    static unsigned last_w = 0, last_h = 0;
+    static size_t last_pitch = 0;
+    if (w != last_w || h != last_h || pitch != last_pitch) {
+        std::printf("[HDPACK] video_frame=%ux%u pitch=%zu format=%u full_rows=active\n",
+                    w, h, pitch, static_cast<unsigned>(s.m_format));
+        last_w = w; last_h = h; last_pitch = pitch;
+    }
+    s.width = w; s.height = h;
+    s.pixels.resize(static_cast<size_t>(w) * h);
     for (unsigned y=0;y<h;++y) for (unsigned x=0;x<w;++x) {
         const auto* at = static_cast<const uint8_t*>(data) + y * pitch + x * bytes;
         uint32_t r,g,b;

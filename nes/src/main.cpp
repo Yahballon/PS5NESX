@@ -1,4 +1,4 @@
-// (AI-assisted) PS5NES native app. SPDX-License-Identifier: GPL-3.0-or-later
+// (AI-assisted) NESYX native app. SPDX-License-Identifier: GPL-3.0-or-later
 #include "core_session.h"
 #include "games.h"
 #include "demo_renderer.hpp"
@@ -134,14 +134,14 @@ void Draw(ps5::demo::Canvas& canvas) noexcept {
     return_latch=return_combo;
     if(in_game) {
         canvas.clear(Color::background);
-        canvas.text(64,30,"PS5NES V1 MODDED BY YAHBALLON",3,Color::cyan);
+        canvas.text(64,30,"NESYX BY YAHBALLON",3,Color::cyan);
         // (AI-assisted) Integer scaling keeps the NES pixels sharp; needs proper testing on PS5.
         if(!session->pixels.empty())canvas.blit(session->pixels.data(),session->width,session->height,4);
         canvas.text(64,1030,"L1 R1 TOUCHPAD: MENU    OPTIONS: START    TOUCHPAD: SELECT",3,Color::white);
         return;
     }
     canvas.clear(Color::background);
-    canvas.text(100,70,"PS5NES",12,Color::cyan);
+    canvas.text(100,70,"NESYX",12,Color::cyan);
     canvas.text(100,190,"V1 MODDED BY YAHBALLON",4,Color::white);
     const size_t first=(selection/12)*12;
     for(size_t row=0;row<12&&first+row<games.size();++row) {
@@ -165,7 +165,7 @@ int main() {
     mkdir((data_root+"/saves").c_str(),0777);mkdir((data_root+"/logs").c_str(),0777);
     int fd=open((data_root+"/logs/boot.log").c_str(),O_WRONLY|O_CREAT|O_TRUNC|O_APPEND,0666);
     if(fd>=0){dup2(fd,fileno(stdout));dup2(fd,fileno(stderr));close(fd);setvbuf(stdout,nullptr,_IONBF,0);}
-    std::printf("[nes] PS5NES v1 modded by YAHBALLON (AI-assisted), filesystem=%u path=%s\n",unsigned(access),data_root.c_str());
+    std::printf("[nes] NESYX by YAHBALLON (AI-assisted), filesystem=%u path=%s\n",unsigned(access),data_root.c_str());
     sceUserServiceInitialize(nullptr);sceUserServiceGetInitialUser(&user);scePadInit();
     pad=scePadOpen(user,0,0,nullptr);bool sound=audio.Open();
     nes::Session core(data_root+"/saves");session=&core;Refresh();

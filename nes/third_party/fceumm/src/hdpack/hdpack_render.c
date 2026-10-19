@@ -64,6 +64,7 @@ static int16_t  hd_line_low_bg_spr[HD_SCREEN_WIDTH];
 
 static int32_t hd_scroll_x_line;
 static hd_pack_tile *hd_cached_tile;
+static hd_tile_key hd_cached_key;
 static int hd_use_cached_tile;
 static int hd_cache_enabled;
 
@@ -787,18 +788,30 @@ static hd_pack_tile *hd_get_cached_matching_tile(uint32_t x, uint32_t y,
       hd_ppu_tile_info *tile)
 {
    hd_pack_tile *result;
+   hd_tile_key key;
    int disable_cache = 0;
 
+   /* The old shortcut trusted the start-of-line scroll value for 8
+    * pixels. Games with a status bar or mid-scanline register writes can
+    * change the CHR tile or palette *inside* that 8-pixel interval.
+    * Reusing the former tile there produces a flickering HUD / left seam.
+    * Compare the real per-pixel key before reusing the last match.
+    * Save the key BEFORE lookup because a fallback can mutate tile_index. */
+   memcpy(&key, tile, sizeof(key));
    if (((hd_scroll_x_line + (int32_t)x) & 0x07) == 0)
       hd_use_cached_tile = 0;
 
-   if (hd_use_cached_tile)
+   if (hd_use_cached_tile && hd_tile_key_equal(&hd_cached_key, &key))
       return hd_cached_tile;
 
+   /* Cache mismatches need a fresh lookup. A negative match is cached
+    * too, but only until the *actual* key changes. */
+   hd_use_cached_tile = 0;
    result = hd_get_matching_tile(x, y, tile, &disable_cache);
    if (!disable_cache && hd_cache_enabled)
    {
       hd_cached_tile = result;
+      hd_cached_key = key;
       hd_use_cached_tile = 1;
    }
    return result;
@@ -1327,6 +1340,20 @@ const uint32_t *HDNes_ComposeFrame(void)
 
    if (!hdnes_active || !hd_frame_buf || !hd_screen.pixels)
       return NULL;
+
+   /* Clean the COMPLETE high-resolution frame before composing it.
+    * Backdrop drawing usually covers every pixel, but some pack layers
+    * and interrupted PPU captures can leave old image data behind. */
+   memset(hd_frame_buf, 0, (size_t)hd_frame_pixels * sizeof(*hd_frame_buf));
+   {
+      static uint32_t reported_width = 0;
+      if (reported_width != screen_width)
+      {
+         hd_log("HD compose: %ux%u, scale=%u, buffer_clear=active, tile_key_guard=active",
+               screen_width, HD_SCREEN_HEIGHT * hd.scale, hd.scale);
+         reported_width = screen_width;
+      }
+   }
 
    /* per-frame condition cache reset */
    for (i = 0; i < hd.cond_count; i++)

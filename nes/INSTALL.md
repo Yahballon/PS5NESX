@@ -1,12 +1,12 @@
-# PS5NES v1.0.0.9 installation
+# NESYX installation (PPSA99204)
 
 (AI-assisted) This package contains the original PS5SX2-style NES app, custom controller bindings and YAHBALLON's supplied logo.
 
 1. Copy the complete PPSA99204 folder to /data/homebrew/PPSA99204/.
 2. Keep sce_module/libc.prx, lapy.elf, lapy-manifest.json and sce_sys/icon0.png.
-3. Launch PS5NES through your compatible PS5 homebrew launcher.
+3. Launch NESYX through your compatible PS5 homebrew launcher.
 
-Your game/save/settings folders are under /data/PS5NES/. Do not replace them when updating.
+Your existing NESYX game/save/settings folders stay under /data/PS5NES/. Do not replace them when updating.
 
 Add .nes, .unf, .unif or single-ROM ZIP files to:
 

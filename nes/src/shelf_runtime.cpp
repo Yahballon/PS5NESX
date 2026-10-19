@@ -1,5 +1,6 @@
 // (AI-assisted) NES core/video/audio integration, preserving the original shelf renderer.
 #include "shelf_runtime.h"
+#include "game_viewport.h"
 #include "games.h"
 #include "fe_settings.h"
 #include <array>
@@ -7,6 +8,7 @@
 #include <atomic>
 #include <cmath>
 #include <cstring>
+#include <cstdio>
 #include <mutex>
 #include <thread>
 #include <time.h>
@@ -38,7 +40,18 @@ bool ShelfRuntime::Start(const std::string& path,fe::Renderer& renderer) {
     auto get=[&](const std::string& key,const std::string& fallback){auto at=options.find(key);return at==options.end()?fallback:at->second;};
     core.SetOption("fceumm_region",get("NES/Region","Auto"));
     core.SetOption("fceumm_palette",get("NES/Palette","default"));
-    aspect=get("NES/Aspect","4:3");bindings.Load(options);sound=get("NES/Sound","true")=="true";
+    const bool hd_enabled = get("NES/HDPacks","false") == "true";
+    core.SetOption("fceumm_hdpacks",hd_enabled ? "enabled" : "disabled");
+    const auto slash=path.find_last_of('/');
+    const auto basename=path.substr(slash==std::string::npos?0:slash+1);
+    const auto dot=basename.find_last_of('.');
+    const auto stem=dot==std::string::npos?basename:basename.substr(0,dot);
+    const std::string hdfile=root+"/HdPacks/"+stem+"/hires.txt";
+    bool present=false;
+    if(FILE* file=std::fopen(hdfile.c_str(),"rb")){present=true;std::fclose(file);}
+    std::printf("[HDPACK] requested=%s file=%s present=%d\n",
+        hd_enabled?"ON":"OFF",hdfile.c_str(),present?1:0);
+    aspect=get("NES/Aspect","16:9");bindings.Load(options);sound=get("NES/Sound","true")=="true";
     if(!core.Load(path,std::move(rom))){error=core.error;return false;}
     if(sound){audio=std::make_unique<ShelfAudio>();if(!audio->Open()){error="NES audio port failed";audio.reset();}}
     menu_atlas=renderer.Atlas();active=true;previous=0;accumulated=0;last_save=0;
@@ -74,9 +87,14 @@ bool ShelfRuntime::Build(fe::Renderer& renderer,fe::FrameDesc& frame,uint32_t ra
     frame.bg.glow_pos[2]=frame.bg.glow_pos[3]=1;
     frame.bg.floor_glow[2]=frame.bg.floor_glow[3]=1;
     frame.bg.misc[0]=float(renderer.width())/renderer.height();frame.bg.misc[1]=0.5f;
-    float w=renderer.width(),h=renderer.height();float width=std::min(w,h*4.0f/3.0f),height=width*3.0f/4.0f;
-    if(aspect=="Integer"){float scale=std::max(1.0f,std::floor(std::min(w/core.width,h/core.height)));width=core.width*scale;height=core.height*scale;}
-    const float x=(w-width)/2,y=(h-height)/2;
+    // Stretch 16:9 to the full native display framebuffer (including 1080p
+    // and 4K). The classic 4:3 and strict integer-pixel modes remain optional.
+    // NES games originate at 256x240, so fullscreen intentionally widens art.
+    const float w=static_cast<float>(renderer.width());
+    const float h=static_cast<float>(renderer.height());
+    const GameViewport view=CalcGameViewport(w,h,
+        static_cast<float>(core.width),static_cast<float>(core.height),aspect);
+    const float width=view.width,height=view.height,x=view.x,y=view.y;
     auto vertex=[](float x,float y,float u,float v){return fe::UiVertex{x,y,u,v,0xffffffff,0,0,0,2};};
     frame.ui={vertex(x,y,0,0),vertex(x+width,y,1,0),vertex(x,y+height,0,1),
               vertex(x,y+height,0,1),vertex(x+width,y,1,0),vertex(x+width,y+height,1,1)};
